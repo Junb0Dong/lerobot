@@ -199,3 +199,14 @@ uv run lerobot-rollout \
 
 - 本文只记录当前仓库已实现的 v3.0 map-style/streaming dataloader contract，不把旧版 v2 格式当作原生输入。
 - 下一步若要真正接入某个 policy，需要拿到该 policy 的输入输出 schema、历史帧/动作窗口、动作单位和目标环境/机器人，再按第 4 节实现 config、model、processor 与 smoke tests。
+
+## 8. 熟悉项目与迁移的推荐路线
+
+不要从硬件或复杂 VLA policy 开始。先以 ACT 为参考实现，按以下顺序阅读和实验：
+
+1. 先看 `scripts/lerobot_train.py`，定位 dataset、policy、processor、optimizer 和训练循环的创建位置。
+2. 再看 `policies/factory.py`、`policies/pretrained.py`，理解 feature 推导、动态注册、checkpoint 加载和 policy 最低接口。
+3. 接着看 `datasets/dataset_metadata.py`、`datasets/lerobot_dataset.py`、`datasets/sampler.py`，确认一个样本的 key、shape、时间窗口和 episode 边界。
+4. 最后看 `processor/pipeline.py`、`processor/normalize_processor.py` 和 `policies/act/`，分别理解通用数据变换、归一化以及一个完整 policy 的 config/model/processor 配套关系。
+
+迁移前应先写清自己的 policy contract：输入 key 和 shape、图像布局与 dtype、历史帧需求、动作 chunk/horizon、动作顺序和单位、归一化方式、训练 loss、推理时是否有缓存。实现顺序建议为 `configuration_<name>.py` → `modeling_<name>.py` → `processor_<name>.py` → batch smoke test → 两步训练和 checkpoint reload；确认离线链路后再做仿真或真机 rollout。
