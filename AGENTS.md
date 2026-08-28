@@ -55,3 +55,13 @@ pre-commit run --all-files                           # Lint + format (ruff, typo
 - **Optional dependencies**: many policies, envs, and robots are behind extras (e.g., `lerobot[aloha]`, see `pyproject.toml`). Guard optional imports with `TYPE_CHECKING or _foo_available` at module top + a `require_package(...)` check at use time. Reuse the `_foo_available` flags in `utils/import_utils.py`; don't call `is_package_available`.
 - **Video decoding**: datasets can store observations as video files. `LeRobotDataset` handles frame extraction, but tests need ffmpeg installed.
 - **Prioritize use of `uv run`** to execute Python commands (not raw `python` or `pip`).
+
+## Project Memory Workflow
+
+- `agent_docs/` 中的文档文件名统一使用两位递增序号和月日后缀：`NN_<topic>_MMDD.md`（例如 `01_project_and_policy_pipeline_0828.md`）。新增文档先查看当前最大序号，再顺序递增；同一天也不能复用序号。
+
+- Before substantial work, read this file, `lessons.md`, and the relevant files in `agent_docs/`. Treat source code, tests, and current configs as authoritative when memory or docs disagree.
+- Record only user-confirmed corrections in `lessons.md`; state the mistake, the corrected rule, and how to avoid repeating it. Do not invent lessons.
+- After material implementation or investigation, update the relevant `agent_docs/` file with the date, current status, decisions, commands/verification, and concrete next steps. Keep it concise and never store secrets, tokens, machine-specific credentials, or large logs.
+- For policy work, distinguish offline held-out loss (`dataset.eval_split` + `eval_steps`), simulation benchmark evaluation (`lerobot-eval`), and real-robot deployment/evaluation (`lerobot-rollout`).
+- Real hardware commands are side-effectful. Confirm robot type, ports, calibration IDs, camera mapping, power/safety setup, and an emergency-stop method before connecting or moving hardware.
