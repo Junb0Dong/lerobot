@@ -13,14 +13,86 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 
 from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.utils.constants import OBS_IMAGES, OBS_PREFIX, OBS_STATE, OBS_STR
 
-from .pipeline import ObservationProcessorStep, ProcessorStepRegistry
+from .pipeline import (
+    ComplementaryDataProcessorStep,
+    ObservationProcessorStep,
+    PolicyActionProcessorStep,
+    ProcessorStepRegistry,
+)
+
+
+@dataclass
+@ProcessorStepRegistry.register(name="robocasa_task_index_processor")
+class RoboCasaTaskIndexProcessorStep(ComplementaryDataProcessorStep):
+    """Map RoboCasa episode language to the task indices used during training."""
+
+    task_index_map: dict[str, int]
+
+    def complementary_data(self, complementary_data: dict[str, Any]) -> dict[str, Any]:
+        """Insert a batched int64 ``task_index`` and reject unseen instructions."""
+        tasks = complementary_data.get("task")
+        if isinstance(tasks, str):
+            task_batch = [tasks]
+        elif isinstance(tasks, (list, tuple)):
+            task_batch = list(tasks)
+        elif hasattr(tasks, "tolist"):
+            task_batch = list(tasks.tolist())
+        else:
+            raise TypeError("RoboCasa task descriptions must be a string or a sequence of strings")
+
+        unknown = [task for task in task_batch if task not in self.task_index_map]
+        if unknown:
+            raise KeyError(f"Unmapped RoboCasa task descriptions: {unknown}")
+        complementary_data["task_index"] = torch.tensor(
+            [self.task_index_map[task] for task in task_batch], dtype=torch.long
+        )
+        return complementary_data
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        """Task metadata does not change policy observation features."""
+        return features
+
+
+@dataclass
+@ProcessorStepRegistry.register(name="robocasa_action_clip_processor")
+class RoboCasaActionClipProcessorStep(PolicyActionProcessorStep):
+    """Clamp normalized PandaOmron actions and track how often clipping occurs."""
+
+    low: float = -1.0
+    high: float = 1.0
+    clipped_elements: int = field(default=0, init=False)
+    total_elements: int = field(default=0, init=False)
+
+    def action(self, action: torch.Tensor) -> torch.Tensor:
+        """Clamp one action batch to the RoboCasa control range."""
+        self.clipped_elements += int(((action < self.low) | (action > self.high)).sum().item())
+        self.total_elements += action.numel()
+        return action.clamp(self.low, self.high)
+
+    def metrics(self) -> dict[str, float | int]:
+        """Return cumulative clipping diagnostics for the evaluation report."""
+        fraction = self.clipped_elements / self.total_elements if self.total_elements else 0.0
+        return {
+            "clipped_elements": self.clipped_elements,
+            "total_elements": self.total_elements,
+            "clipping_fraction": fraction,
+        }
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        """Clipping preserves the declared action shape and modality."""
+        return features
 
 
 @dataclass

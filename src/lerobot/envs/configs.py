@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import abc
 import importlib
+import json
 from dataclasses import dataclass, field, fields
+from pathlib import Path
 from typing import Any
 
 import draccus
@@ -24,7 +26,13 @@ import gymnasium as gym
 from gymnasium.envs.registration import registry as gym_registry
 
 from lerobot.configs import FeatureType, PolicyFeature
-from lerobot.processor import IsaaclabArenaProcessorStep, LiberoProcessorStep, PolicyProcessorPipeline
+from lerobot.processor import (
+    IsaaclabArenaProcessorStep,
+    LiberoProcessorStep,
+    PolicyProcessorPipeline,
+    RoboCasaActionClipProcessorStep,
+    RoboCasaTaskIndexProcessorStep,
+)
 from lerobot.robots import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.utils.constants import (
@@ -520,6 +528,7 @@ class RoboCasaEnv(EnvConfig):
     visualization_height: int = 512
     visualization_width: int = 512
     split: str | None = None
+    task_index_map_path: Path | None = None
     # Object-mesh registries to sample from. Upstream default is
     # ("objaverse", "lightwheel"), but objaverse is ~30GB and the CI image
     # only ships the lightwheel pack. Override to include objaverse once
@@ -578,6 +587,24 @@ class RoboCasaEnv(EnvConfig):
             env_cls=env_cls,
             episode_length=self.episode_length,
             obj_registries=tuple(self.obj_registries),
+        )
+
+    def get_env_processors(self):
+        preprocessor_steps = []
+        if self.task_index_map_path is not None:
+            path = Path(self.task_index_map_path)
+            if not path.is_file():
+                raise FileNotFoundError(f"RoboCasa task-index map does not exist: {path}")
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            raw_mapping = payload.get("task_index_map") if isinstance(payload, dict) else None
+            if not isinstance(raw_mapping, dict) or not raw_mapping:
+                raise ValueError(f"RoboCasa task-index map must contain a non-empty task_index_map: {path}")
+            if not all(isinstance(key, str) and isinstance(value, int) for key, value in raw_mapping.items()):
+                raise ValueError("RoboCasa task-index entries must map strings to integers")
+            preprocessor_steps.append(RoboCasaTaskIndexProcessorStep(task_index_map=raw_mapping))
+        return (
+            PolicyProcessorPipeline(steps=preprocessor_steps),
+            PolicyProcessorPipeline(steps=[RoboCasaActionClipProcessorStep()]),
         )
 
 

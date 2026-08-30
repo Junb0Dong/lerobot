@@ -1,0 +1,11 @@
+{
+  "name": "robocasa_atomic4_v3_actioncodec",
+  "num_tasks": 9,
+  "task_index_map": {
+    "Close the right drawer.": 0,
+    "Close the left drawer.": 1,
+    "Press the button on the coffee machine to serve coffee.": 3,
+    "Press the stop button on the microwave.": 5,
+    "Turn off the sink faucet.": 7
+  }
+}

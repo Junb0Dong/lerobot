@@ -105,6 +105,17 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def _collect_processor_metrics(*pipelines: PolicyProcessorPipeline) -> dict[str, dict[str, Any]]:
+    """Collect optional diagnostics exposed by processor steps."""
+    metrics: dict[str, dict[str, Any]] = {}
+    for pipeline in pipelines:
+        for step in pipeline.steps:
+            get_metrics = getattr(step, "metrics", None)
+            if callable(get_metrics):
+                metrics[type(step).__name__] = get_metrics()
+    return metrics
+
+
 def _env_features_to_dataset_features(env_features: dict) -> dict:
     """Convert EnvConfig.features to the dict format expected by LeRobotDataset.create()."""
     features = {}
@@ -807,6 +818,10 @@ def eval_main(cfg: EvalPipelineConfig):
         )
         logger.info("Overall Aggregated Metrics:")
         logger.info(info["overall"])
+
+        processor_metrics = _collect_processor_metrics(env_preprocessor, env_postprocessor)
+        if processor_metrics:
+            info["processor_metrics"] = processor_metrics
 
         # Print per-suite stats
         for task_group, task_group_info in info.items():

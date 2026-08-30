@@ -15,6 +15,9 @@
 ### Environments & Dependencies ###
 .env
 .venv
+.venv-dlc
+.venv-robocasa-dlc
+scripts/dlc/.env
 env/
 venv/
 env.bak/

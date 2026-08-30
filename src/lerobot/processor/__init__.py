@@ -40,7 +40,12 @@ from .converters import (
 )
 from .delta_action_processor import MapDeltaActionToRobotActionStep, MapTensorToDeltaActionDictStep
 from .device_processor import DeviceProcessorStep
-from .env_processor import IsaaclabArenaProcessorStep, LiberoProcessorStep
+from .env_processor import (
+    IsaaclabArenaProcessorStep,
+    LiberoProcessorStep,
+    RoboCasaActionClipProcessorStep,
+    RoboCasaTaskIndexProcessorStep,
+)
 from .factory import (
     DefaultPolicyProcessorSteps,
     make_default_policy_processor_steps,
@@ -165,6 +170,8 @@ __all__ = [
     "DataProcessorPipeline",
     "IsaaclabArenaProcessorStep",
     "LiberoProcessorStep",
+    "RoboCasaActionClipProcessorStep",
+    "RoboCasaTaskIndexProcessorStep",
     "TimeLimitProcessorStep",
     "AddBatchDimensionProcessorStep",
     "RobotProcessorPipeline",

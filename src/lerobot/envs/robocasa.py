@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from collections.abc import Callable, Sequence
+from contextlib import contextmanager
 from functools import partial
 from typing import Any
 
@@ -70,6 +71,42 @@ _TASK_GROUP_SPLITS = {
     "pretrain200": "pretrain",
     "pretrain300": "pretrain",
 }
+
+
+@contextmanager
+def _robocasa_numpy_version_compat():
+    """Bridge RoboCasa's NumPy-2 version assert to the NGC Torch NumPy-1 ABI.
+
+    RoboCasa commit a07e365 hard-asserts the string ``2.2.5`` at import time,
+    while the pinned NGC Torch 2.7 image cannot bridge NumPy 2 arrays. The
+    simulator code used by rollout is NumPy-1 compatible, so expose the
+    asserted version only while importing RoboCasa and restore it immediately.
+    """
+    actual_version = np.__version__
+    if actual_version == "2.2.5":
+        yield
+        return
+    if actual_version != "1.26.4":
+        raise RuntimeError(
+            f"RoboCasa rollout requires NumPy 1.26.4 (NGC Torch ABI) or 2.2.5, got {actual_version}"
+        )
+    np.__version__ = "2.2.5"
+    try:
+        yield
+    finally:
+        np.__version__ = actual_version
+
+
+def _get_robocasa_gym_env_class():
+    """Import the fixed RoboCasa wrapper under the narrow NumPy ABI shim."""
+    # RoboSuite imports SciPy, whose feature detection must see the real NumPy
+    # 1.26.4 version. Load it fully before the RoboCasa-only assert shim.
+    import robosuite  # noqa: F401
+
+    with _robocasa_numpy_version_compat():
+        from robocasa.wrappers.gym_wrapper import RoboCasaGymEnv
+
+    return RoboCasaGymEnv
 
 
 def _resolve_tasks(task: str) -> tuple[list[str], str | None]:
@@ -160,9 +197,9 @@ class RoboCasaEnv(gym.Env):
         self.visualization_height = visualization_height
         self.split = split
         self.obj_registries = tuple(obj_registries)
-        # Per-worker index (0..n_envs-1) used to spread the user-provided
-        # seed across factories so each sub-env explores a distinct layout
-        # even when the same seed is passed to `reset()`.
+        # Per-worker index (0..n_envs-1) is only a fallback when reset is
+        # unseeded. Gymnasium VectorEnv already supplies a distinct seed to
+        # every worker when reset receives a seed list.
         self.episode_index = int(episode_index)
 
         self.camera_name = parse_camera_names(camera_name)
@@ -217,13 +254,13 @@ class RoboCasaEnv(gym.Env):
         """
         if self._env is not None:
             return
-        from robocasa.wrappers.gym_wrapper import RoboCasaGymEnv
+        robocasa_gym_env_cls = _get_robocasa_gym_env_class()
 
         # RoboCasaGymEnv defaults split="test", which create_env rejects
         # (only None/"all"/"pretrain"/"target" are valid). Always pass a
         # valid value so we don't hit that default. Extra kwargs are
         # forwarded to the underlying kitchen env via create_env/robosuite.make.
-        self._env = RoboCasaGymEnv(
+        self._env = robocasa_gym_env_cls(
             env_name=self.task,
             camera_widths=self.observation_width,
             camera_heights=self.observation_height,
@@ -265,12 +302,9 @@ class RoboCasaEnv(gym.Env):
         self._ensure_env()
         assert self._env is not None
         super().reset(seed=seed)
-        # Spread the seed across workers so n_envs factories don't all
-        # roll the same scene. With an explicit user seed we shift it by
-        # episode_index; with no seed we fall back to episode_index so
-        # each worker is still distinct rather than inheriting the same
-        # global RNG state.
-        worker_seed = seed + self.episode_index if seed is not None else self.episode_index
+        # Preserve the exact per-episode seeds assigned by the evaluator.
+        # Only use episode_index when no explicit seed is supplied.
+        worker_seed = seed if seed is not None else self.episode_index
         raw_obs, info = self._env.reset(seed=worker_seed)
 
         ep_meta = self._env.env.get_ep_meta()
@@ -297,14 +331,8 @@ class RoboCasaEnv(gym.Env):
         info.update({"task": self.task, "done": done, "is_success": is_success})
 
         observation = self._format_raw_obs(raw_obs)
-        if terminated:
-            info["final_info"] = {
-                "task": self.task,
-                "done": bool(done),
-                "is_success": bool(is_success),
-            }
-            self.reset()
-
+        # Return the terminal observation unchanged. The vector environment owns
+        # autoreset; resetting here would consume and discard the next initial state.
         return observation, reward, terminated, truncated, info
 
     def close(self):
