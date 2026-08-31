@@ -1,6 +1,6 @@
 # LeRobot 项目与 Policy 流水线记忆
 
-> 复核时间：2026-08-28。
+> 复核时间：2026-08-30。
 >
 > 仓库：`Junb0Dong/lerobot`，分支 `main`，基准 commit `bf31dd794ffb4f87380aba3912f64421e8352d3c`，项目版本 `0.6.2`。
 
@@ -104,7 +104,15 @@ uv run lerobot-train \
 
 `make_policy()` 根据 dataset metadata 自动建立 input/output features；processor 负责图像、语言、device、归一化、相对/绝对动作等转换。部署时必须连同 checkpoint 中保存的 processor 使用，不能只拿裸模型权重另写归一化逻辑。
 
-训练支持 Accelerate、多 GPU、PEFT、EMA、W&B、streaming dataset、HF Jobs 和多种 checkpoint 格式。需要额外依赖的 policy/env/robot 使用 `pyproject.toml` 中对应 extra，不应无条件导入可选依赖。
+训练支持 Accelerate、多 GPU、PEFT、EMA、TensorBoard、W&B、streaming dataset、HF Jobs 和多种 checkpoint 格式。需要额外依赖的 policy/env/robot 使用 `pyproject.toml` 中对应 extra，不应无条件导入可选依赖。
+
+训练指标默认写入 `{output_dir}/tb` 的 TensorBoard 事件文件（`--tensorboard.enable=false` 可关）。独立 tokenizer 入口同样写 `{output_dir}/tb`。查看：
+
+```bash
+tensorboard --logdir outputs/<job>/tb --port 6006
+```
+
+W&B 仍默认关闭，只有显式 `--wandb.enable=true` 才会连接；两个 backend 可同时开。
 
 ## 6. Checkpoint 与恢复
 
