@@ -138,6 +138,23 @@ def test_get_item_values_are_correct(tmp_path, lerobot_dataset_factory):
     assert item_0["episode_index"].item() == 0
 
 
+def test_get_item_skips_video_decode_when_disabled(tmp_path, lerobot_dataset_factory, monkeypatch):
+    """decode_videos=False must not open video files; tokenizer training relies on this."""
+    dataset = lerobot_dataset_factory(root=tmp_path / "ds", total_episodes=1, total_frames=8, use_videos=True)
+    if not dataset.meta.video_keys:
+        pytest.skip("factory produced no video keys")
+
+    def _fail_decode(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("video decode should be skipped")
+
+    monkeypatch.setattr("lerobot.datasets.dataset_reader.decode_video_frames", _fail_decode)
+    dataset.reader.decode_videos = False
+    item = dataset.reader.get_item(0)
+    for key in dataset.meta.video_keys:
+        assert key not in item
+
+
 # ── Transforms ───────────────────────────────────────────────────────
 
 

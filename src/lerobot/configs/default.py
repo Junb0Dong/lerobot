@@ -48,6 +48,9 @@ class DatasetConfig:
     # When True, RGB video frames are returned as uint8 tensors (0-255) instead of float32 (0.0-1.0).
     # This reduces memory and speeds up DataLoader IPC. The training pipeline handles the conversion.
     return_uint8: bool = False
+    # After decoding RGB frames, bilinear-resize them to this square size in the DataLoader
+    # worker (uint8) before IPC. None keeps the native camera resolution (ACT / VLAs).
+    decode_image_size: int | None = None
     # Physical unit depth maps are dequantized to at load time: "mm" (millimeters) or "m" (metres).
     # Has no effect on datasets without depth cameras.
     depth_output_unit: str = DEFAULT_DEPTH_UNIT
@@ -72,6 +75,8 @@ class DatasetConfig:
             )
         if not (0.0 <= self.eval_split < 1.0):
             raise ValueError(f"eval_split must be in [0.0, 1.0), got {self.eval_split}")
+        if self.decode_image_size is not None and int(self.decode_image_size) <= 0:
+            raise ValueError(f"decode_image_size must be a positive int, got {self.decode_image_size}")
         if self.episodes is not None:
             if any(ep < 0 for ep in self.episodes):
                 raise ValueError(
@@ -101,6 +106,13 @@ class WandBConfig:
     run_id: str | None = None
     mode: str | None = None  # Allowed values: 'online', 'offline' 'disabled'. Defaults to 'online'
     add_tags: bool = True  # If True, save configuration as tags in the WandB run.
+
+
+@dataclass
+class TensorBoardConfig:
+    enable: bool = True
+    # Empty/None writes to `{output_dir}/tb`. Set an explicit path to override.
+    log_dir: str | None = None
 
 
 @dataclass

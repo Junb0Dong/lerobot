@@ -38,8 +38,10 @@ from .utils import (
 )
 from .video_utils import (
     VideoDecoderCache,
+    dataset_decoder_cache_max_size,
     decode_video_frames,
     decode_video_frames_torchcodec,
+    resize_uint8_hw,
 )
 
 
@@ -261,6 +263,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         shuffle: bool = True,
         return_uint8: bool = False,
         depth_output_unit: str = DEFAULT_DEPTH_UNIT,
+        decode_image_size: int | None = None,
         *,
         repo_type: Literal["dataset", "bucket"] = "dataset",
         token: str | bool | None = None,
@@ -316,6 +319,9 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         self.buffer_size = buffer_size
         self._return_uint8 = return_uint8
         self._depth_output_unit = depth_output_unit
+        if decode_image_size is not None and int(decode_image_size) <= 0:
+            raise ValueError(f"decode_image_size must be a positive int, got {decode_image_size}")
+        self._decode_image_size = decode_image_size
 
         # We cache the video decoders to avoid re-initializing them at each frame (avoiding a ~10x slowdown)
         self.video_decoder_cache = None
@@ -335,6 +341,9 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         self.root = self.meta.root
         self.revision = self.meta.revision
         self.meta.rescale_depth_stats(self._depth_output_unit)
+        n_rgb = len([key for key in self.meta.video_keys if key not in self.meta.depth_keys])
+        n_episodes = len(self.episodes) if self.episodes is not None else self.meta.total_episodes
+        self._decoder_cache_max_size = dataset_decoder_cache_max_size(n_episodes, n_rgb)
         # Check version
         check_version_compatibility(self.repo_id, self.meta._version, CODEBASE_VERSION)
 
@@ -416,7 +425,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
     # in parallel, feeding a queue from which this iterator will yield processed items.
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         if self.video_decoder_cache is None:
-            self.video_decoder_cache = VideoDecoderCache()
+            self.video_decoder_cache = VideoDecoderCache(max_size=self._decoder_cache_max_size)
 
         # keep the same seed across exhaustions if shuffle is False, otherwise shuffle data across exhaustions
         rng = np.random.default_rng(self.seed) if not self.shuffle else self.rng
@@ -562,6 +571,12 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 current_ts, self.delta_indices, episode_boundaries_ts
             )
             video_frames = self._query_videos(query_timestamps, ep_idx)
+
+            if self._decode_image_size is not None:
+                for cam in self.meta.camera_keys:
+                    if cam in self.meta.depth_keys or cam not in video_frames:
+                        continue
+                    video_frames[cam] = resize_uint8_hw(video_frames[cam], self._decode_image_size)
 
             if self.image_transforms is not None:
                 image_keys = self.meta.camera_keys

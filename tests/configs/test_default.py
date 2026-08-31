@@ -62,3 +62,12 @@ def test_dataset_config_bucket_requires_streaming():
 def test_dataset_config_bucket_rejects_eval_split():
     with pytest.raises(ValueError, match="eval_split"):
         DatasetConfig(repo_id="user/repo", repo_type="bucket", streaming=True, eval_split=0.1)
+
+
+def test_dataset_config_decode_image_size_default_none():
+    assert DatasetConfig(repo_id="user/repo").decode_image_size is None
+
+
+def test_dataset_config_decode_image_size_must_be_positive():
+    with pytest.raises(ValueError, match="decode_image_size"):
+        DatasetConfig(repo_id="user/repo", decode_image_size=0)

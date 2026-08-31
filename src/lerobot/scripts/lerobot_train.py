@@ -57,6 +57,7 @@ from lerobot.common.train_utils import (
     should_save_checkpoint,
     update_last_checkpoint,
 )
+from lerobot.common.tensorboard_utils import TensorBoardLogger
 from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import JobConfig, parser
 from lerobot.configs.train import TrainPipelineConfig
@@ -420,11 +421,13 @@ def train(cfg: TrainPipelineConfig):
     if is_main_process():
         logging.info(pformat(cfg.to_dict()))
 
-    if cfg.wandb.enable and cfg.wandb.project and is_main_process():
-        wandb_logger = WandBLogger(cfg)
-    else:
-        wandb_logger = None
-        if is_main_process():
+    loggers: list[TensorBoardLogger | WandBLogger] = []
+    if is_main_process():
+        if cfg.tensorboard.enable:
+            loggers.append(TensorBoardLogger(cfg))
+        if cfg.wandb.enable and cfg.wandb.project:
+            loggers.append(WandBLogger(cfg))
+        if not loggers:
             logging.info(colored("Logs will be saved locally.", "yellow", attrs=["bold"]))
 
     if cfg.seed is not None:
@@ -767,7 +770,7 @@ def train(cfg: TrainPipelineConfig):
                 if train_tracker.step_s.avg > 0:
                     train_tracker.samples_per_s = samples_per_step / train_tracker.step_s.avg
                 logging.info(train_tracker)
-                if wandb_logger:
+                if loggers:
                     # Policy sub-losses (latent_loss, action_loss, ...) are aggregated into the
                     # tracker by update_policy, so to_dict() already carries their windowed,
                     # rank-reduced averages — no per-step output_dict passthrough needed.
@@ -779,7 +782,8 @@ def train(cfg: TrainPipelineConfig):
                     if ema is not None and ema.cur_decay_value is not None:
                         wandb_log_dict["ema/decay"] = ema.cur_decay_value
                         wandb_log_dict["ema/step"] = ema.optimization_step
-                    wandb_logger.log_dict(wandb_log_dict, step)
+                    for logger in loggers:
+                        logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 
         if is_eval_step:
@@ -801,8 +805,8 @@ def train(cfg: TrainPipelineConfig):
 
             if is_main_process():
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
-                if wandb_logger:
-                    wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
+                for logger in loggers:
+                    logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
 
         if cfg.save_checkpoint and is_saving_step:
             # Collective: every rank participates (gathers / DCP shard writes); rank-0-only file
@@ -840,8 +844,8 @@ def train(cfg: TrainPipelineConfig):
                         cfg.policy.repo_id,
                         private=cfg.policy.private,
                     )
-                if wandb_logger:
-                    wandb_logger.log_policy(checkpoint_dir)
+                for logger in loggers:
+                    logger.log_policy(checkpoint_dir)
             accelerator.wait_for_everyone()
 
         if cfg.env and is_env_eval_step:
@@ -894,16 +898,21 @@ def train(cfg: TrainPipelineConfig):
                 eval_tracker.eval_s = aggregated.pop("eval_s")
                 eval_tracker.avg_sum_reward = aggregated.pop("avg_sum_reward")
                 eval_tracker.pc_success = aggregated.pop("pc_success")
-                if wandb_logger:
+                if loggers:
                     wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
-                    wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
-                    wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+                    for logger in loggers:
+                        logger.log_dict(wandb_log_dict, step, mode="eval")
+                        logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 
             accelerator.wait_for_everyone()
 
     if is_main_process():
         progbar.close()
         logging.info("End of training")
+        for logger in loggers:
+            close = getattr(logger, "close", None)
+            if close is not None:
+                close()
 
     # --- publish (collective-safe: all ranks; the model commit gathers sharded weights) ---------
     if getattr(active_cfg, "push_to_hub", False):

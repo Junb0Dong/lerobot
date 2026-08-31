@@ -58,6 +58,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         download_videos: bool = True,
         video_backend: str | None = None,
         return_uint8: bool = False,
+        decode_videos: bool = True,
+        decode_image_size: int | None = None,
         depth_output_unit: str = DEFAULT_DEPTH_UNIT,
         batch_encoding_size: int = 1,
         rgb_encoder: RGBEncoderConfig | None = None,
@@ -185,6 +187,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 True.
             video_backend (str | None, optional): Video backend to use for decoding videos. Defaults to torchcodec when available int the platform; otherwise, defaults to 'pyav'.
                 You can also use the 'pyav' decoder used by Torchvision, which used to be the default option, or 'video_reader' which is another decoder of Torchvision.
+            decode_videos (bool, optional): If False, skip video decoding in ``__getitem__``. Tokenizer
+                training only needs action/state windows; leaving this True with ``batch_size=512`` makes
+                pyav the bottleneck. Policy training should keep the default True.
+            decode_image_size (int | None, optional): If set, RGB frames are bilinear-resized to this
+                square size inside the DataLoader worker after decode. ``None`` keeps native resolution.
             batch_encoding_size (int, optional): Number of episodes to accumulate before batch encoding videos.
                 Set to 1 for immediate encoding (default), or higher for batched encoding. Defaults to 1.
             rgb_encoder (RGBEncoderConfig | None, optional): Video encoder settings for cameras
@@ -218,6 +225,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.revision = revision if revision else CODEBASE_VERSION
         self._video_backend = video_backend if video_backend else get_safe_default_video_backend()
         self._return_uint8 = return_uint8
+        self._decode_videos = decode_videos
+        self._decode_image_size = decode_image_size
         self._depth_output_unit = depth_output_unit
         self._batch_encoding_size = batch_encoding_size
         self._encoder_threads = encoder_threads
@@ -264,7 +273,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
             delta_timestamps=delta_timestamps,
             image_transforms=image_transforms,
             return_uint8=self._return_uint8,
+            decode_videos=self._decode_videos,
             depth_output_unit=self._depth_output_unit,
+            decode_image_size=self._decode_image_size,
         )
         self.image_transforms = image_transforms
 
@@ -338,7 +349,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 delta_timestamps=self.delta_timestamps,
                 image_transforms=self.image_transforms,
                 return_uint8=self._return_uint8,
+                decode_videos=self._decode_videos,
                 depth_output_unit=self._depth_output_unit,
+                decode_image_size=self._decode_image_size,
             )
         return self.reader
 
@@ -765,6 +778,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.episodes = None
         obj._video_backend = video_backend if video_backend is not None else get_safe_default_video_backend()
         obj._return_uint8 = False
+        obj._decode_videos = True
         obj._depth_output_unit = DEFAULT_DEPTH_UNIT
         obj._batch_encoding_size = batch_encoding_size
         obj._encoder_threads = encoder_threads
@@ -868,6 +882,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.episodes = None
         obj._video_backend = video_backend if video_backend else get_safe_default_video_backend()
         obj._return_uint8 = False
+        obj._decode_videos = True
         obj._depth_output_unit = DEFAULT_DEPTH_UNIT
         obj._batch_encoding_size = batch_encoding_size
 

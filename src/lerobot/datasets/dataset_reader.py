@@ -40,7 +40,12 @@ from .io_utils import (
     load_nested_dataset,
 )
 from .utils import resolve_episode_indices
-from .video_utils import decode_video_frames
+from .video_utils import (
+    VideoDecoderCache,
+    dataset_decoder_cache_max_size,
+    decode_video_frames,
+    resize_uint8_hw,
+)
 
 
 class DatasetReader:
@@ -59,7 +64,9 @@ class DatasetReader:
         delta_timestamps: dict[str, list[float]] | None,
         image_transforms: Callable | None,
         return_uint8: bool = False,
+        decode_videos: bool = True,
         depth_output_unit: str = DEFAULT_DEPTH_UNIT,
+        decode_image_size: int | None = None,
     ):
         """Initialize the reader with metadata, filtering, and transform config.
 
@@ -79,8 +86,12 @@ class DatasetReader:
                 visual features.
             return_uint8: If True, return RGB video frames as raw uint8 tensors
                 instead of normalized float32.
+            decode_videos: If False, skip ``_query_videos``. Action-only consumers such as
+                the semantic tokenizer should set this False.
             depth_output_unit: Physical unit depth maps are dequantized to
                 (``"m"`` or ``"mm"``). Defaults to ``"mm"``.
+            decode_image_size: If set, bilinear-resize RGB cameras to this square size
+                after decode and before ``image_transforms``. Depth maps are left native.
         """
         self._meta = meta
         self.root = root
@@ -91,7 +102,15 @@ class DatasetReader:
             raise TypeError("image_transforms must be callable or None.")
         self._image_transforms = image_transforms
         self._return_uint8 = return_uint8
+        self.decode_videos = decode_videos
         self._depth_output_unit = depth_output_unit
+        if decode_image_size is not None and int(decode_image_size) <= 0:
+            raise ValueError(f"decode_image_size must be a positive int, got {decode_image_size}")
+        self._decode_image_size = decode_image_size
+        n_rgb = len([key for key in meta.video_keys if key not in meta.depth_keys])
+        n_episodes = len(self.episodes) if self.episodes is not None else meta.total_episodes
+        self._decoder_cache_max_size = dataset_decoder_cache_max_size(n_episodes, n_rgb)
+        self._decoder_cache: VideoDecoderCache | None = None
 
         self.hf_dataset: datasets.Dataset | None = None
         self._absolute_to_relative_idx: dict[int, int] | None = None
@@ -123,6 +142,21 @@ class DatasetReader:
     def clear_image_transforms(self) -> None:
         """Remove the transform applied to visual observations."""
         self._image_transforms = None
+
+    def _ensure_decoder_cache(self) -> VideoDecoderCache:
+        """Create the torchcodec LRU in this process (DataLoader workers after spawn)."""
+        if self._decoder_cache is None:
+            self._decoder_cache = VideoDecoderCache(max_size=self._decoder_cache_max_size)
+        return self._decoder_cache
+
+    def _resize_rgb_cameras(self, item: dict) -> dict:
+        if self._decode_image_size is None:
+            return item
+        for cam in self._meta.camera_keys:
+            if cam in self._meta.depth_keys or cam not in item:
+                continue
+            item[cam] = resize_uint8_hw(item[cam], self._decode_image_size)
+        return item
 
     def try_load(self) -> bool:
         """Attempt to load from local cache. Returns True if data is sufficient."""
@@ -310,6 +344,7 @@ class DatasetReader:
                 self._video_backend,
                 return_uint8=self._return_uint8,
                 is_depth=vid_key in self._meta.depth_keys,
+                decoder_cache=self._ensure_decoder_cache(),
             )
             if vid_key in self._meta.depth_keys:
                 depth_encoder = self._depth_encoder_configs[vid_key]
@@ -353,15 +388,17 @@ class DatasetReader:
             for key, val in query_result.items():
                 item[key] = val
 
-        if len(self._meta.video_keys) > 0:
+        if self.decode_videos and len(self._meta.video_keys) > 0:
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
             video_frames = self._query_videos(query_timestamps, ep_idx)
             item = {**video_frames, **item}
 
+        item = self._resize_rgb_cameras(item)
+
         if self._image_transforms is not None:
             for cam in self._meta.camera_keys:
-                if cam in self._meta.depth_keys:
+                if cam in self._meta.depth_keys or cam not in item:
                     continue
                 item[cam] = self._image_transforms(item[cam])
 

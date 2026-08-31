@@ -144,6 +144,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 return_uint8=True,
                 depth_output_unit=cfg.dataset.depth_output_unit,
                 tolerance_s=cfg.tolerance_s,
+                decode_image_size=cfg.dataset.decode_image_size,
             )
         else:
             dataset = StreamingLeRobotDataset(
@@ -157,6 +158,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 tolerance_s=cfg.tolerance_s,
                 return_uint8=True,
                 repo_type=cfg.dataset.repo_type,
+                decode_image_size=cfg.dataset.decode_image_size,
             )
     else:
         raise NotImplementedError("The MultiLeRobotDataset isn't supported for now.")
@@ -238,6 +240,7 @@ def make_train_eval_datasets(
         video_backend=cfg.dataset.video_backend,
         return_uint8=True,
         tolerance_s=cfg.tolerance_s,
+        decode_image_size=cfg.dataset.decode_image_size,
     )
 
     eval_dataset = LeRobotDataset(
@@ -250,6 +253,7 @@ def make_train_eval_datasets(
         video_backend=cfg.dataset.video_backend,
         return_uint8=True,
         tolerance_s=cfg.tolerance_s,
+        decode_image_size=cfg.dataset.decode_image_size,
     )
 
     if cfg.dataset.use_imagenet_stats:

@@ -13,6 +13,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import contextlib
 import glob
 import importlib
@@ -60,6 +62,7 @@ def decode_video_frames(
     backend: str | None = None,
     return_uint8: bool = False,
     is_depth: bool = False,
+    decoder_cache: VideoDecoderCache | None = None,
 ) -> torch.Tensor:
     """
     Decodes video frames using the specified backend.
@@ -74,6 +77,7 @@ def decode_video_frames(
         return_uint8 (bool): For RGB videos, if True return raw uint8 frames without float32 normalization.
             This reduces memory for DataLoader IPC; normalization can be done on GPU afterward.
         is_depth (bool): Set to True if the video is a depth map (1 channel, uint12).
+        decoder_cache: Optional torchcodec decoder LRU. Forwarded only for the torchcodec backend.
 
     Returns:
         torch.Tensor: Decoded frames (RGB: float32 in [0,1] by default, or uint8 if return_uint8=True, Depth: uint12).
@@ -90,7 +94,13 @@ def decode_video_frames(
     if backend is None:
         backend = get_safe_default_video_backend()
     if backend == "torchcodec":
-        return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s, return_uint8=return_uint8)
+        return decode_video_frames_torchcodec(
+            video_path,
+            timestamps,
+            tolerance_s,
+            decoder_cache=decoder_cache,
+            return_uint8=return_uint8,
+        )
     elif backend == "pyav":
         return decode_video_frames_pyav(
             video_path, timestamps, tolerance_s, return_uint8=return_uint8, is_depth=is_depth
@@ -234,6 +244,73 @@ an open ``fsspec`` file handle — on the order of a few MB per entry. Override
 via the ``LEROBOT_VIDEO_DECODER_CACHE_SIZE`` env var or by passing ``max_size``
 to the constructor (``None`` restores the legacy unbounded behaviour).
 """
+
+
+def decoder_cache_capacity(
+    n_episodes: int, n_rgb_video_keys: int, default: int = DEFAULT_DECODER_CACHE_SIZE
+) -> int:
+    """Return an LRU size that can hold every RGB video file in the selected split."""
+    if n_episodes < 0 or n_rgb_video_keys < 0:
+        raise ValueError(
+            f"n_episodes and n_rgb_video_keys must be >= 0, got {n_episodes}, {n_rgb_video_keys}"
+        )
+    return max(int(default), int(n_episodes) * int(n_rgb_video_keys))
+
+
+def dataset_decoder_cache_max_size(n_episodes: int, n_rgb_video_keys: int) -> int | None:
+    """LRU size for a dataset reader. ``LEROBOT_VIDEO_DECODER_CACHE_SIZE`` still wins when set."""
+    if os.environ.get("LEROBOT_VIDEO_DECODER_CACHE_SIZE") is not None:
+        return _default_max_cache_size()
+    return decoder_cache_capacity(n_episodes, n_rgb_video_keys)
+
+
+def resize_uint8_hw(frames: torch.Tensor, size: int) -> torch.Tensor:
+    """Bilinear-resize RGB tensors to a square ``size``, keeping uint8 when the input was uint8.
+
+    Accepts ``(C, H, W)``, ``(T, C, H, W)``, or channel-last layouts. Returns the input
+    object unchanged when spatial dims already match ``size``.
+    """
+    if size <= 0:
+        raise ValueError(f"resize size must be positive, got {size}")
+    if frames.ndim == 3:
+        if frames.shape[0] in (1, 3):
+            layout = "chw"
+            batched = frames.unsqueeze(0)
+        elif frames.shape[-1] in (1, 3):
+            layout = "hwc"
+            batched = frames.permute(2, 0, 1).unsqueeze(0)
+        else:
+            raise ValueError(f"Unable to infer CHW layout from shape {tuple(frames.shape)}")
+    elif frames.ndim == 4:
+        if frames.shape[1] in (1, 3):
+            layout = "tchw"
+            batched = frames
+        elif frames.shape[-1] in (1, 3):
+            layout = "thwc"
+            batched = frames.permute(0, 3, 1, 2)
+        else:
+            raise ValueError(f"Unable to infer TCHW layout from shape {tuple(frames.shape)}")
+    else:
+        raise ValueError(f"Expected a 3D or 4D image tensor, got shape {tuple(frames.shape)}")
+
+    if batched.shape[-2] == size and batched.shape[-1] == size:
+        return frames
+
+    resized = torch.nn.functional.interpolate(
+        batched.float(), size=(size, size), mode="bilinear", align_corners=False
+    )
+    if frames.dtype == torch.uint8 or (resized.numel() and float(resized.max()) > 1.5):
+        out = resized.round().clamp(0, 255).to(torch.uint8)
+    else:
+        out = resized.clamp(0, 1).to(dtype=frames.dtype)
+
+    if layout == "chw":
+        return out[0]
+    if layout == "hwc":
+        return out[0].permute(1, 2, 0)
+    if layout == "tchw":
+        return out
+    return out.permute(0, 2, 3, 1)
 
 
 def _default_max_cache_size() -> int | None:
