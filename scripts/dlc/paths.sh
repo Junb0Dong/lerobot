@@ -40,21 +40,26 @@ ATOMIC4_V3_ROOT="${ATOMIC4_V3_ROOT:-${CODE_DIR}/outputs/datasets}"
 ATOMIC4_MERGED="${ATOMIC4_MERGED:-${ATOMIC4_V3_ROOT}/robocasa_atomic4_v3}"
 ATOMIC4_REPO_ID="${ATOMIC4_REPO_ID:-robocasa/atomic4}"
 
+# TOKENIZER_BATCH_SIZE is independent of policy BATCH_SIZE. Tokenizer is action-only
+# and uses matched_h20-scale batches (512 on day/full). Policy stays small-batch
+# because video decode is the bottleneck. STAGE=test keeps both small.
 STAGE="${STAGE:-test}"
 case "${STAGE}" in
   test)
     TOKENIZER_STEPS="${TOKENIZER_STEPS:-80}"
     POLICY_STEPS="${POLICY_STEPS:-40}"
     BATCH_SIZE="${BATCH_SIZE:-4}"
+    TOKENIZER_BATCH_SIZE="${TOKENIZER_BATCH_SIZE:-4}"
     NUM_WORKERS="${NUM_WORKERS:-2}"
     MAX_RUNNING_MINUTES="${MAX_RUNNING_MINUTES:-2880}"
     ;;
   day)
-    # Same-day 4090+pyav run: ~3 step/s at batch=4, ~2 at batch=8.
-    # 10k+10k ≈ 2–4h wall, well under STAGE=full 50k/100k.
-    TOKENIZER_STEPS="${TOKENIZER_STEPS:-10000}"
+    # Policy stays small-batch (video decode bound). Tokenizer is action-only and
+    # follows actioncodec matched_h20: batch 512, 20k steps.
+    TOKENIZER_STEPS="${TOKENIZER_STEPS:-20000}"
     POLICY_STEPS="${POLICY_STEPS:-10000}"
     BATCH_SIZE="${BATCH_SIZE:-8}"
+    TOKENIZER_BATCH_SIZE="${TOKENIZER_BATCH_SIZE:-512}"
     NUM_WORKERS="${NUM_WORKERS:-4}"
     MAX_RUNNING_MINUTES="${MAX_RUNNING_MINUTES:-2880}"
     ;;
@@ -62,6 +67,7 @@ case "${STAGE}" in
     TOKENIZER_STEPS="${TOKENIZER_STEPS:-50000}"
     POLICY_STEPS="${POLICY_STEPS:-100000}"
     BATCH_SIZE="${BATCH_SIZE:-8}"
+    TOKENIZER_BATCH_SIZE="${TOKENIZER_BATCH_SIZE:-512}"
     NUM_WORKERS="${NUM_WORKERS:-4}"
     MAX_RUNNING_MINUTES="${MAX_RUNNING_MINUTES:-10080}"
     ;;

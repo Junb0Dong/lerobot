@@ -20,6 +20,7 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .configuration_actioncodec import ActionCodecConfig
+from .obs_encoder import ObservationEncoder
 
 
 class FrozenTokenizerAdapter(nn.Module):
@@ -129,69 +130,13 @@ class FrozenTokenizerAdapter(nn.Module):
         return self.model.detokenize(tokens)
 
 
-class _VisionEncoder(nn.Module):
-    def __init__(self, output_dim: int) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(3, 32, 5, stride=2, padding=2),
-            nn.GroupNorm(4, 32),
-            nn.SiLU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.SiLU(),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),
-            nn.GroupNorm(16, 128),
-            nn.SiLU(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(128, output_dim),
-        )
-
-    def forward(self, images: torch.Tensor, image_size: int) -> torch.Tensor:
-        if images.ndim != 5:
-            raise ValueError(f"images must have shape [B, T, C, H, W], got {tuple(images.shape)}")
-        if images.shape[-1] == 3 and images.shape[2] != 3:
-            images = images.permute(0, 1, 4, 2, 3)
-        bsz, steps, channels, height, width = images.shape
-        if channels != 3:
-            raise ValueError(f"RGB image must have three channels, got {channels}")
-        flat = images.float().reshape(bsz * steps, channels, height, width)
-        if flat.max() > 1.5:
-            flat = flat / 255.0
-        flat = F.interpolate(flat, size=(image_size, image_size), mode="bilinear", align_corners=False)
-        return self.net(flat).view(bsz, steps, -1)
-
-
-class ObservationEncoder(nn.Module):
-    def __init__(self, config: ActionCodecConfig) -> None:
-        super().__init__()
-        self.image_keys = list(config.image_features)
-        self.state_dim = config.robot_state_feature.shape[0] if config.robot_state_feature is not None else 0
-        self.image_encoders = nn.ModuleList(
-            [_VisionEncoder(config.vision_feature_dim) for _ in self.image_keys]
-        )
-        self.image_size = config.image_size
-        self.num_tasks = max(1, config.num_tasks)
-        self.output_dim = len(self.image_keys) * config.vision_feature_dim + self.state_dim + 1
-
-    def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        features = [
-            encoder(batch[key], self.image_size)
-            for key, encoder in zip(self.image_keys, self.image_encoders, strict=True)
-        ]
-        state = batch[OBS_STATE].float()
-        if state.ndim != 3 or state.shape[-1] != self.state_dim:
-            raise ValueError(f"observation.state must have shape [B, T, {self.state_dim}]")
-        task_uid = batch.get("task_uid", batch.get("task_index"))
-        if task_uid is None:
-            raise KeyError("task_uid is required by ActionCodec task-token conditioning")
-        if task_uid.ndim == 2 and task_uid.shape[-1] == 1:
-            task_uid = task_uid[:, 0]
-        if task_uid.ndim == 3:
-            task_uid = task_uid[:, 0, 0]
-        task_scalar = 2 * task_uid.float().view(-1, 1, 1) / max(1, self.num_tasks - 1) - 1
-        features.extend([state, task_scalar.expand(-1, state.shape[1], -1)])
-        return torch.cat(features, dim=-1)
+def _token_metrics(logits: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
+    with torch.no_grad():
+        pred = logits.argmax(dim=-1)
+        acc = pred.eq(target).float().mean()
+        k = min(5, int(logits.shape[-1]))
+        top5 = logits.topk(k, dim=-1).indices.eq(target.unsqueeze(-1)).any(dim=-1).float().mean()
+    return {"token_accuracy": float(acc.item()), "token_top5_acc": float(top5.item())}
 
 
 class RMSNorm(nn.Module):
@@ -281,8 +226,22 @@ class OATExactCached(nn.Module):
         self.norm = RMSNorm(self.embed_dim)
         self.head = nn.Linear(self.embed_dim, self.vocab_size, bias=False)
         self.head.weight = self.token_emb.weight
+        self._init_weights()
         self.use_task_token = True
-        self.task_embedding = nn.Embedding(config.num_tasks, self.embed_dim)
+        self.num_tasks = int(config.num_tasks)
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(int(config.task_token_init_seed))
+            self.task_embedding = nn.Embedding(self.num_tasks, self.embed_dim)
+            nn.init.xavier_uniform_(self.task_embedding.weight)
+
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, (nn.Linear, nn.Embedding)):
+                nn.init.xavier_uniform_(module.weight)
+                if getattr(module, "bias", None) is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, RMSNorm):
+                nn.init.ones_(module.weight)
 
     def _memory(self, cond: torch.Tensor, task_ids: torch.Tensor) -> torch.Tensor:
         if cond.shape[1] > self.max_cond_len:
@@ -328,7 +287,7 @@ class OATExactCached(nn.Module):
         cond: torch.Tensor,
         max_new_tokens: int,
         task_ids: torch.Tensor,
-        temperature: float = 0.0,
+        temperature: float = 1.0,
         top_k: int = 0,
     ) -> torch.Tensor:
         memory = self._memory(cond, task_ids)
@@ -417,7 +376,47 @@ class ActionCodecPolicy(PreTrainedPolicy):
             self.config.tokenizer_path = tokenizer_path
 
     def get_optim_params(self) -> list[dict[str, Any]]:  # type: ignore[override]
-        return [{"params": [p for p in self.parameters() if p.requires_grad]}]
+        policy_decay, policy_nodecay, obs_decay, obs_nodecay = [], [], [], []
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            is_obs = name.startswith("obs_encoder.")
+            decay = param.ndim >= 2
+            if is_obs and decay:
+                obs_decay.append(param)
+            elif is_obs:
+                obs_nodecay.append(param)
+            elif decay:
+                policy_decay.append(param)
+            else:
+                policy_nodecay.append(param)
+        groups = [
+            {
+                "params": policy_decay,
+                "lr": self.config.optimizer_lr,
+                "weight_decay": self.config.optimizer_weight_decay,
+                "name": "policy_decay",
+            },
+            {
+                "params": policy_nodecay,
+                "lr": self.config.optimizer_lr,
+                "weight_decay": 0.0,
+                "name": "policy_nodecay",
+            },
+            {
+                "params": obs_decay,
+                "lr": self.config.optimizer_lr_obs_encoder,
+                "weight_decay": self.config.optimizer_weight_decay,
+                "name": "obs_decay",
+            },
+            {
+                "params": obs_nodecay,
+                "lr": self.config.optimizer_lr_obs_encoder,
+                "weight_decay": 0.0,
+                "name": "obs_nodecay",
+            },
+        ]
+        return [group for group in groups if len(group["params"]) > 0]
 
     def reset(self) -> None:
         """Clear action and online observation history at an episode boundary."""
@@ -481,13 +480,19 @@ class ActionCodecPolicy(PreTrainedPolicy):
         )
         input_ids = torch.cat((bos, tokens), dim=1)
         features = self.obs_encoder(batch)
-        logits = self.model(input_ids[:, :-1], features, self._task_ids(batch))
+        task_ids = self._task_ids(batch)
+        logits = self.model(input_ids[:, :-1], features, task_ids)
         target = input_ids[:, 1:]
         loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), target.reshape(-1))
-        return loss, {
-            "token_ce": float(loss.detach().item()),
-            "token_accuracy": float(logits.argmax(-1).eq(target).float().mean().item()),
-        }
+        metrics = {"token_ce": float(loss.detach().item()), **_token_metrics(logits, target)}
+        if (not self.training) and self.config.num_tasks >= 2:
+            swapped_ids = (task_ids + 1) % self.config.num_tasks
+            swapped_logits = self.model(input_ids[:, :-1], features, swapped_ids)
+            swapped_loss = F.cross_entropy(
+                swapped_logits.reshape(-1, swapped_logits.shape[-1]), target.reshape(-1)
+            )
+            metrics["task_token_swap_ce_gap"] = float((swapped_loss - loss).item())
+        return loss, metrics
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:

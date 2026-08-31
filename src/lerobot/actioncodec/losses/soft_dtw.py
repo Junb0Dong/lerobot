@@ -75,7 +75,7 @@ def _softmin3(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, gamma: float) -
         gamma: Smoothing temperature; as it goes to zero the result approaches a hard ``min``.
 
     Returns:
-        Scalar tensor equal to ``-gamma * logsumexp([a, b, c] / -gamma)``.
+        Tensor equal to ``-gamma * logsumexp([a, b, c] / -gamma)`` with the same shape as ``a``.
     """
     return -gamma * torch.logsumexp(torch.stack((a, b, c)) / -gamma, dim=0)
 
@@ -114,6 +114,39 @@ def _soft_dtw_distance(cost: torch.Tensor, gamma: float) -> torch.Tensor:
     return table[rows][columns]
 
 
+def _soft_dtw_distance_batch(cost: torch.Tensor, gamma: float) -> torch.Tensor:
+    """Run soft-DTW on a batch of precomputed step-cost matrices.
+
+    The DP still walks the ``[N, M]`` grid sequentially, but every cell update is a single
+    vectorized op over the pair axis. This is the Torch fallback used when the CUDA Soft-DTW
+    extension is not installed.
+
+    Args:
+        cost: Pairwise step costs of shape ``[P, N, M]``.
+        gamma: Smoothing temperature of the soft-minimum; must be positive.
+
+    Returns:
+        Distances of shape ``[P]``, differentiable with respect to ``cost``.
+
+    Raises:
+        ValueError: If ``cost`` is not 3-D or ``gamma`` is not positive.
+    """
+    if cost.ndim != 3 or gamma <= 0:
+        raise ValueError("cost must be [P, N, M] and gamma must be positive")
+    pairs, rows, columns = cost.shape
+    table = cost.new_full((pairs, rows + 1, columns + 1), float("inf"))
+    table[:, 0, 0] = 0
+    for row in range(1, rows + 1):
+        for column in range(1, columns + 1):
+            table[:, row, column] = cost[:, row - 1, column - 1] + _softmin3(
+                table[:, row - 1, column],
+                table[:, row, column - 1],
+                table[:, row - 1, column - 1],
+                gamma,
+            )
+    return table[:, rows, columns]
+
+
 def _step_cost(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
     """Build the pairwise step-cost matrix between two time series.
 
@@ -131,6 +164,27 @@ def _step_cost(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
     if first.ndim != 2 or second.ndim != 2 or first.shape[-1] != second.shape[-1]:
         raise ValueError("DTW trajectories must have shape [T, D] with matching D")
     return (first[:, None] - second[None]).pow(2).mean(-1)
+
+
+def _step_cost_batch(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
+    """Build batched pairwise step-cost matrices between two stacks of time series.
+
+    Args:
+        first: Sequences of shape ``[P, T1, D]``.
+        second: Sequences of shape ``[P, T2, D]``.
+
+    Returns:
+        Cost tensors of shape ``[P, T1, T2]``.
+
+    Raises:
+        ValueError: If either input is not 3-D, the pair counts differ, or the feature dimensions
+            differ.
+    """
+    if first.ndim != 3 or second.ndim != 3 or first.shape[0] != second.shape[0]:
+        raise ValueError("batched DTW trajectories must have shape [P, T, D] with matching P")
+    if first.shape[-1] != second.shape[-1]:
+        raise ValueError("DTW trajectories must have matching feature dimensions")
+    return (first[:, :, None] - second[:, None, :]).pow(2).mean(-1)
 
 
 def _chunk_cost(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
@@ -215,7 +269,68 @@ def soft_dtw_distance_only(first: torch.Tensor, second: torch.Tensor, gamma: flo
         Detached scalar tensor with the soft-DTW distance.
     """
     with torch.no_grad():
-        return _soft_dtw_distance(_pairwise_cost(first.float(), second.float()), gamma).detach()
+        cost = _pairwise_cost(first.float(), second.float())
+        return _soft_dtw_distance_batch(cost.unsqueeze(0), gamma).squeeze(0).detach()
+
+
+def _resolve_dtw_backend(dtw_backend: DTWBackend) -> Literal["torch"]:
+    """Resolve the public backend flag to the implementation that is available here.
+
+    ``auto`` and ``torch`` both select the vectorized Torch DP. ``cuda`` is accepted as a
+    reserved name so later wiring of ``softdtw-cuda-torch`` does not change the call surface,
+    but it is not implemented in this tree yet.
+
+    Args:
+        dtw_backend: Requested backend.
+
+    Returns:
+        ``"torch"``.
+
+    Raises:
+        ValueError: If ``dtw_backend`` is not one of ``auto``, ``torch``, or ``cuda``.
+        RuntimeError: If ``dtw_backend`` is ``cuda``.
+    """
+    if dtw_backend not in ("auto", "torch", "cuda"):
+        raise ValueError(f"dtw_backend must be one of auto|torch|cuda, got {dtw_backend!r}")
+    if dtw_backend == "cuda":
+        raise RuntimeError(
+            "dtw_backend='cuda' requires installing softdtw-cuda-torch; "
+            "use dtw_backend='torch' or 'auto' for the vectorized Torch backend"
+        )
+    return "torch"
+
+
+def _compute_chunk_pair_distances(
+    delta_state: torch.Tensor,
+    pair_indices: torch.Tensor,
+    gamma: float,
+    pair_batch_size: int,
+    backend: Literal["torch"],
+) -> torch.Tensor:
+    """Score unordered chunk pairs with the vectorized Torch soft-DTW.
+
+    Args:
+        delta_state: Sequences of shape ``[B, T, D]``.
+        pair_indices: Integer pairs of shape ``[P, 2]``.
+        gamma: Soft-minimum temperature.
+        pair_batch_size: Maximum number of pairs in one DP call.
+        backend: Must be ``torch``; accepted so a CUDA branch can be added later.
+
+    Returns:
+        Detached distances of shape ``[P]``.
+    """
+    del backend
+    if pair_indices.numel() == 0:
+        return delta_state.new_empty((0,), dtype=torch.float32)
+    distances = []
+    batch_size = max(1, int(pair_batch_size))
+    for start in range(0, int(pair_indices.shape[0]), batch_size):
+        pairs = pair_indices[start : start + batch_size]
+        seq_a = delta_state.index_select(0, pairs[:, 0])
+        seq_b = delta_state.index_select(0, pairs[:, 1])
+        cost = _step_cost_batch(seq_a.detach().float(), seq_b.detach().float())
+        distances.append(_soft_dtw_distance_batch(cost, gamma).detach())
+    return torch.cat(distances, dim=0).to(dtype=torch.float32)
 
 
 def chunk_soft_dtw_targets(
@@ -241,8 +356,10 @@ def chunk_soft_dtw_targets(
         gamma: Soft-minimum temperature forwarded to soft-DTW.
         max_candidate_pairs: Cap on the number of unordered pairs to score. When the candidate set
             exceeds twice this value it is randomly subsampled down to it.
-        pair_batch_size: Accepted for API compatibility with the batched backends and ignored.
-        dtw_backend: Accepted for API compatibility and ignored; scoring always runs in torch.
+        pair_batch_size: Number of unordered pairs scored together in one vectorized Torch DP.
+        dtw_backend: ``torch`` or ``auto`` use the vectorized Torch backend. ``cuda`` is reserved
+            for the optional ``softdtw-cuda-torch`` extension and raises until that extra is
+            installed.
         min_delta_norm: Root-mean-square motion below which a chunk counts as static and is
             excluded from mining altogether.
         normalize_delta: Standardize the deltas before scoring, so that dimensions with a large
@@ -256,8 +373,8 @@ def chunk_soft_dtw_targets(
     Raises:
         ValueError: If ``delta_state`` is not 3-D, or if ``positive_topk`` or ``gamma`` are not
             positive.
+        RuntimeError: If ``dtw_backend`` is ``cuda`` but ``softdtw-cuda-torch`` is not installed.
     """
-    del pair_batch_size, dtw_backend
     if delta_state.ndim != 3:
         raise ValueError("delta_state must have shape [B, T, D]")
     if positive_topk <= 0 or gamma <= 0:
@@ -280,10 +397,18 @@ def chunk_soft_dtw_targets(
     values = standardized if normalize_delta else raw
     distances = raw.new_full((batch, batch), float("inf"), dtype=torch.float32)
     distances.fill_diagonal_(0)
-    for first, second in torch.triu(candidate, diagonal=1).nonzero(as_tuple=False).tolist():
-        distance = soft_dtw_distance_only(values[first], values[second], gamma)
-        distances[first, second] = distance
-        distances[second, first] = distance
+    resolved_backend = _resolve_dtw_backend(dtw_backend)
+    upper_pairs = torch.triu(candidate, diagonal=1).nonzero(as_tuple=False)
+    pair_distances = _compute_chunk_pair_distances(
+        values,
+        upper_pairs,
+        gamma=gamma,
+        pair_batch_size=pair_batch_size,
+        backend=resolved_backend,
+    )
+    if upper_pairs.numel() > 0:
+        distances[upper_pairs[:, 0], upper_pairs[:, 1]] = pair_distances
+        distances[upper_pairs[:, 1], upper_pairs[:, 0]] = pair_distances
     positive = torch.zeros_like(candidate)
     selected = distances[candidate & torch.isfinite(distances)]
     threshold = (

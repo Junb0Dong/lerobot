@@ -64,8 +64,10 @@ bash scripts/dlc/submit.sh scripts/dlc/cmd_robocasa_atomic4_eval.sh
 `CHECKPOINT=/mnt/data/.../pretrained_model` 显式覆盖。评估不会续训或改写 checkpoint；每个阶段前后都会
 核验模型、processor 与 tokenizer 文件的 SHA-256。
 
-评估协议为 seed 42、EGL、Lightwheel objects、异步 vector env、确定性 argmax（checkpoint
-`temperature=0`）、两帧 observation history、每 16 步重规划 20-step chunk。任务固定为
+评估协议为 seed 42、EGL、Lightwheel objects、异步 vector env、两帧 observation history、
+每 16 步重规划 20-step chunk。新训产物默认 `temperature=1.0` + `top_k=10`（oat-exact formal
+eval）；要对齐旧 CNN checkpoint 的确定性 argmax，读 checkpoint 里保存的 `temperature`
+或显式 `--policy.temperature=0`。任务固定为
 `CloseDrawer`、`StartCoffeeMachine`、`TurnOffMicrowave`、`TurnOffSinkFaucet`，horizon 从固定的
 RoboCasa registry 读取（450/300/300/300）。报告中 `StartCoffeeMachine` 同时标注历史别名
 `CoffeePressButton`。

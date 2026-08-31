@@ -522,8 +522,8 @@ lerobot_dlc_train_tokenizer() {
   action_dim="$(lerobot_dlc_resolve_action_dim)"
   # tokenizer CLI 没有 FileExists 检查；保存时 mkdir(parents=True, exist_ok=True)。
   mkdir -p "${output_dir}" "${RUN_ROOT}/logs"
-  lerobot_dlc_log "tokenizer repo=${ROBOCASA_REPO_ID} root=${ROBOCASA_V3_DATASET} action_dim=${action_dim} steps=${TOKENIZER_STEPS} alignment=${ALIGNMENT_WEIGHT} decoder=${DECODER_TYPE}"
-  "${python}" -m lerobot.scripts.lerobot_train_actioncodec_tokenizer --repo_id="${ROBOCASA_REPO_ID}" --root="${ROBOCASA_V3_DATASET}" --output_dir="${output_dir}" --action_dim="${action_dim}" --action_horizon=20 --latent_horizon=16 --codebook_size=1024 --num_codebooks=1 --alignment_weight="${ALIGNMENT_WEIGHT}" --decoder_type="${DECODER_TYPE}" --device=cuda --steps="${TOKENIZER_STEPS}" --batch_size="${BATCH_SIZE}" --num_workers="${NUM_WORKERS}" --log_freq=10
+  lerobot_dlc_log "tokenizer repo=${ROBOCASA_REPO_ID} root=${ROBOCASA_V3_DATASET} action_dim=${action_dim} steps=${TOKENIZER_STEPS} batch=${TOKENIZER_BATCH_SIZE:-${BATCH_SIZE}} alignment=${ALIGNMENT_WEIGHT} decoder=${DECODER_TYPE}"
+  "${python}" -m lerobot.scripts.lerobot_train_actioncodec_tokenizer --repo_id="${ROBOCASA_REPO_ID}" --root="${ROBOCASA_V3_DATASET}" --output_dir="${output_dir}" --action_dim="${action_dim}" --action_horizon=20 --latent_horizon=16 --codebook_size=1024 --num_codebooks=1 --alignment_weight="${ALIGNMENT_WEIGHT}" --decoder_type="${DECODER_TYPE}" --device=cuda --steps="${TOKENIZER_STEPS}" --batch_size="${TOKENIZER_BATCH_SIZE:-${BATCH_SIZE}}" --num_workers="${NUM_WORKERS}" --log_freq=10
   test -f "${output_dir}/model.safetensors"
   test -f "${output_dir}/model_config.json"
   test -f "${output_dir}/action_stats.json"
@@ -568,7 +568,7 @@ lerobot_dlc_train_policy() {
   lerobot_dlc_log "policy repo=${ROBOCASA_REPO_ID} root=${ROBOCASA_V3_DATASET} action_dim=${action_dim} num_tasks=${num_tasks} tokenizer=${tokenizer_path} steps=${POLICY_STEPS}"
   # UserCommand 里不要用反斜杠续行；这里已经是单行。
   # shellcheck disable=SC2086
-  "${python}" -m lerobot.scripts.lerobot_train --dataset.repo_id="${ROBOCASA_REPO_ID}" --dataset.root="${ROBOCASA_V3_DATASET}" --policy.type=actioncodec --policy.action_dim="${action_dim}" --policy.num_tasks="${num_tasks}" --policy.tokenizer_path="${tokenizer_path}" --policy.push_to_hub=false --policy.device=cuda --output_dir="${output_dir}" --job_name="actioncodec-${ROBOCASA_TASK:-CloseDrawer}" --steps="${POLICY_STEPS}" --batch_size="${BATCH_SIZE}" --num_workers="${NUM_WORKERS}" --log_freq=10 --save_freq="${POLICY_STEPS}" --env_eval_freq=0 --save_checkpoint=true ${wandb_flags}
+  "${python}" -m lerobot.scripts.lerobot_train --dataset.repo_id="${ROBOCASA_REPO_ID}" --dataset.root="${ROBOCASA_V3_DATASET}" --policy.type=actioncodec --policy.action_dim="${action_dim}" --policy.num_tasks="${num_tasks}" --policy.tokenizer_path="${tokenizer_path}" --policy.push_to_hub=false --policy.device=cuda --output_dir="${output_dir}" --job_name="actioncodec-${ROBOCASA_TASK:-CloseDrawer}" --steps="${POLICY_STEPS}" --batch_size="${BATCH_SIZE}" --num_workers="${NUM_WORKERS}" --log_freq=10 --save_freq="${POLICY_STEPS}" --env_eval_freq=0 --save_checkpoint=true --ema.enable=true --ema.power=0.75 --ema.max_decay=0.9999 --accelerator.mixed_precision=bf16 ${wandb_flags}
   test -d "${output_dir}/checkpoints/last/pretrained_model"
   lerobot_dlc_log "POLICY_OK ${output_dir}/checkpoints/last/pretrained_model"
 }

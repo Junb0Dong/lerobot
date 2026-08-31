@@ -455,9 +455,15 @@ class ActionPerceiverDecoder(ActionPerceiverEncoder):
             if self.use_latent_self_attn:
                 latent = self.latent_shared if self.share_latent_transformer else self.latent_blocks[index]
                 query = latent(query)
-        output = latents.new_zeros((latents.shape[0], length, self.max_action_dim))
+        output = None
         for index, head in enumerate(self.head):
             mask = ids == index
-            if mask.any():
-                output[mask, :, : head.out_features] = head(query[mask])
+            if not mask.any():
+                continue
+            decoded = head(query[mask])
+            if output is None:
+                output = decoded.new_zeros((query.shape[0], length, self.max_action_dim))
+            output[mask, :, : decoded.shape[-1]] = decoded
+        if output is None:
+            raise ValueError("No valid embodiment decoder outputs were produced for the batch")
         return output

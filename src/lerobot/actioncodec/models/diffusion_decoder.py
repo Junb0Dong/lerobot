@@ -268,11 +268,19 @@ class ActionDiffusionDenoiser(nn.Module):
         for block in self.blocks:
             x = block(x, modulation)
         x = self.out_norm(x)
-        output = x.new_zeros((x.shape[0], x.shape[1], self.max_action_dim))
+        # Allocate from the Linear head output, not from LayerNorm ``x``. Under AMP, LayerNorm
+        # stays fp32 while Linear is autocast to fp16; indexed copy then requires matching dtypes.
+        output = None
         for index, head in enumerate(self.head):
             mask = embodiment_ids == index
-            if mask.any():
-                output[mask, :, : head.out_features] = head(x[mask])
+            if not mask.any():
+                continue
+            decoded = head(x[mask])
+            if output is None:
+                output = decoded.new_zeros((x.shape[0], x.shape[1], self.max_action_dim))
+            output[mask, :, : decoded.shape[-1]] = decoded
+        if output is None:
+            raise ValueError("No valid embodiment denoiser outputs were produced for the batch")
         return output
 
 

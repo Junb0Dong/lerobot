@@ -24,30 +24,30 @@ class ActionCodecTokenizer(nn.Module):
         self,
         action_dim: int = 7,
         window_size: int = 20,
-        model_dim: int = 256,
+        model_dim: int = 512,
         num_tokens: int = 16,
         codebook_size: int = 1024,
         num_codebooks: int = 1,
         num_heads: int = 8,
         encoder_layers: int = 3,
         decoder_layers: int = 3,
-        encoder_cross_layers: int = 1,
-        decoder_cross_layers: int = 1,
+        encoder_cross_layers: int = 8,
+        decoder_cross_layers: int = 8,
         use_encoder_latent_self_attn: bool = True,
         use_decoder_latent_self_attn: bool = True,
-        share_encoder_latent_transformer: bool = False,
-        share_decoder_latent_transformer: bool = False,
-        share_encoder_cross_attn: bool = False,
-        share_decoder_cross_attn: bool = False,
+        share_encoder_latent_transformer: bool = True,
+        share_decoder_latent_transformer: bool = True,
+        share_encoder_cross_attn: bool = True,
+        share_decoder_cross_attn: bool = True,
         dropout: float = 0.1,
-        vq_beta: float = 0.25,
+        vq_beta: float = 1.0,
         embodiment_config: dict[str, Any] | None = None,
         soft_assignment_temperature: float = 1.0,
         dead_code_threshold: int = 100,
         reset_noise_scale: float = 1e-3,
         decoder_type: str = "diffusion",
         diffusion_config: dict[str, Any] | None = None,
-        use_vl_embedder: bool = True,
+        use_vl_embedder: bool = False,
     ) -> None:
         """Build the encoder, quantizer, decoder and optional auxiliary heads.
 
@@ -83,8 +83,8 @@ class ActionCodecTokenizer(nn.Module):
                 ``num_train_steps``, ``num_sample_steps``, ``beta_schedule``, ``predict_target``,
                 ``denoiser_layers`` and ``kernel_size``. Ignored unless ``decoder_type`` is
                 ``"diffusion"``.
-            use_vl_embedder: Build the visual-language embedder needed by the CLIP loss. Disable it
-                when training without images to avoid the extra parameters.
+            use_vl_embedder: Build the visual-language embedder needed by the CLIP loss. Default
+                ``False`` because CLIP is not part of the matched-h20 tokenizer recipe.
 
         Raises:
             ValueError: If ``decoder_type`` is not ``"perceiver"`` or ``"diffusion"``.
@@ -261,7 +261,8 @@ class ActionCodecTokenizer(nn.Module):
                 mining options (``positive_topk``, ``negative_topk``, ``negative_quantile``,
                 ``temperature``, ``band_frac``, ``weight_negative``, ``negative_margin``), and
                 ``weight_chunk_align`` with its soft-DTW options (``chunk_align_positive_topk``,
-                ``chunk_align_gamma``, ``chunk_align_max_candidate_pairs``).
+                ``chunk_align_gamma``, ``chunk_align_max_candidate_pairs``,
+                ``chunk_align_pair_batch_size``, ``chunk_align_dtw_backend``).
             image: Channel-last frames of shape ``[B, H, W, 3]`` for the CLIP loss.
             prompts: ``B`` task strings paired with ``image``.
             step: Global training step, compared against ``clip_start_step`` so the CLIP loss can be
@@ -315,6 +316,8 @@ class ActionCodecTokenizer(nn.Module):
                 positive_topk=int(loss_config.get("chunk_align_positive_topk", 4)),
                 gamma=float(loss_config.get("chunk_align_gamma", 0.1)),
                 max_candidate_pairs=loss_config.get("chunk_align_max_candidate_pairs"),
+                pair_batch_size=int(loss_config.get("chunk_align_pair_batch_size", 8192)),
+                dtw_backend=str(loss_config.get("chunk_align_dtw_backend", "auto")),
             )
             chunk_embeddings = F.normalize(z.float().mean(1), dim=-1)
             alignment_loss = (
