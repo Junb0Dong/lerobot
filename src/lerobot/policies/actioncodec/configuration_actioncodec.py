@@ -26,7 +26,7 @@ class ActionCodecConfig(PreTrainedConfig):
     num_tasks: int = 0
     image_size: int = 128
     vision_feature_dim: int = 64
-    vision_encoder: str = "resnet_spatial"
+    vision_encoder: str = "oat_exact_robomimic"
     spatial_num_kp: int = 32
     crop_shape: tuple[int, int] | None = (76, 76)
     rgb_mode: str = "minus_one_to_one"

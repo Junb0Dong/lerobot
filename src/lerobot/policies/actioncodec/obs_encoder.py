@@ -2,8 +2,9 @@
 
 Ports the oat-exact-policy ``SimpleObservationEncoder`` family onto LeRobot batch keys:
 one encoder per camera from ``config.image_features``, concatenated robot state, and a
-normalized task scalar. ``resnet_spatial`` is the default; ``oat_exact_robomimic`` is the
-optional OAT-exact vision path and requires ``robomimic``.
+normalized task scalar. ``oat_exact_robomimic`` is the default and uses the same robomimic
+crop, ResNet18Conv, SpatialSoftmax, GroupNorm, and output activation as OAT. The smaller
+``resnet_spatial`` and ``small_cnn`` variants remain available for legacy checkpoints.
 """
 
 from __future__ import annotations
@@ -21,8 +22,12 @@ from .configuration_actioncodec import ActionCodecConfig
 
 if TYPE_CHECKING or _robomimic_available:
     import robomimic.models.base_nets as rmbn
+    import robomimic.models.obs_nets as rmon
+    import robomimic.utils.obs_utils as obs_utils
 else:
     rmbn = None
+    rmon = None
+    obs_utils = None
 
 
 def random_crop_2d(images: torch.Tensor, crop_height: int, crop_width: int) -> torch.Tensor:
@@ -195,18 +200,33 @@ def _replace_batch_norm_with_oat_group_norm(module: nn.Module) -> None:
 
 
 class OATExactRobomimicEncoder(nn.Module):
-    """Per-camera robomimic VisualCore with BN→GroupNorm(C/16), matching oat-exact."""
+    """OAT's per-camera robomimic observation encoder, including crop and output ReLU."""
 
-    def __init__(self, image_keys: list[str], crop_shape: tuple[int, int] = (76, 76)) -> None:
+    def __init__(
+        self,
+        image_keys: list[str],
+        image_size: int = 128,
+        crop_shape: tuple[int, int] = (76, 76),
+    ) -> None:
         super().__init__()
-        require_package("robomimic", extra="robomimic")
-        if rmbn is None:
-            raise ImportError("vision_encoder='oat_exact_robomimic' requires robomimic")
+        require_package("robomimic", extra="actioncodec")
+        if rmbn is None or rmon is None or obs_utils is None:
+            raise ImportError(
+                "vision_encoder='oat_exact_robomimic' requires robomimic; "
+                "install LeRobot with the 'actioncodec' extra"
+            )
         self.image_keys = list(image_keys)
+        self.internal_keys = [f"camera_{index}" for index in range(len(self.image_keys))]
+        self.image_size = int(image_size)
         self.crop_shape = (int(crop_shape[0]), int(crop_shape[1]))
+        input_shape = (3, self.image_size, self.image_size)
         cropped_shape = (3, *self.crop_shape)
-        self.networks = nn.ModuleDict()
-        for key in self.image_keys:
+
+        # LeRobot image feature names contain dots, which cannot be ModuleDict keys. Stable aliases
+        # preserve OAT's ObservationEncoder execution order without changing the public batch keys.
+        obs_utils.initialize_obs_modality_mapping_from_dict({"rgb": self.internal_keys})
+        encoder = rmon.ObservationEncoder()
+        for key in self.internal_keys:
             net = rmbn.VisualCore(
                 input_shape=cropped_shape,
                 feature_dimension=64,
@@ -217,17 +237,31 @@ class OATExactRobomimicEncoder(nn.Module):
                 flatten=True,
             )
             _replace_batch_norm_with_oat_group_norm(net)
-            self.networks[key] = net
+            encoder.register_obs_key(
+                name=key,
+                shape=input_shape,
+                net=net,
+                randomizer=rmbn.CropRandomizer(
+                    input_shape=input_shape,
+                    crop_height=self.crop_shape[0],
+                    crop_width=self.crop_shape[1],
+                    num_crops=1,
+                    pos_enc=False,
+                ),
+            )
+        encoder.make()
+        self.encoder = encoder
         self.feature_dim = 64
 
     def encode_dict(self, images_by_key: dict[str, torch.Tensor]) -> list[torch.Tensor]:
-        outputs = []
-        for key in self.image_keys:
-            value = images_by_key[key]
-            bsz, steps = value.shape[:2]
-            cropped = random_crop_2d(value.reshape(bsz * steps, *value.shape[2:]), *self.crop_shape)
-            outputs.append(self.networks[key](cropped).reshape(bsz, steps, self.feature_dim))
-        return outputs
+        sample = images_by_key[self.image_keys[0]]
+        bsz, steps = sample.shape[:2]
+        aliased = {
+            internal_key: images_by_key[public_key].reshape(bsz * steps, *sample.shape[2:])
+            for public_key, internal_key in zip(self.image_keys, self.internal_keys, strict=True)
+        }
+        features = self.encoder(aliased).reshape(bsz, steps, -1)
+        return list(features.split(self.feature_dim, dim=-1))
 
 
 class ObservationEncoder(nn.Module):
@@ -264,7 +298,11 @@ class ObservationEncoder(nn.Module):
             if self.crop_shape is None:
                 raise ValueError("oat_exact_robomimic requires crop_shape")
             self.image_encoders = nn.ModuleList()
-            self.robomimic_encoder = OATExactRobomimicEncoder(self.image_keys, crop_shape=self.crop_shape)
+            self.robomimic_encoder = OATExactRobomimicEncoder(
+                self.image_keys,
+                image_size=self.image_size,
+                crop_shape=self.crop_shape,
+            )
             self.vision_feature_dim = int(self.robomimic_encoder.feature_dim)
         else:
             raise ValueError(f"Unsupported vision_encoder={self.vision_encoder!r}")

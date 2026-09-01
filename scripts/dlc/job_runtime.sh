@@ -214,6 +214,7 @@ lerobot_dlc_venv_usable() {
     return 1
   fi
   if ! out="$("${py}" -c 'import numpy as np
+import robomimic
 import torch
 from importlib.util import find_spec
 if find_spec("lerobot") is None:
@@ -223,7 +224,7 @@ if not version.startswith("2.7"):
     raise SystemExit(f"torch {version} (need 2.7.x) from {torch.__file__}")
 torch.from_numpy(np.zeros((1,), dtype=np.float32))
 print(
-    f"lerobot+torch ok {version} {torch.__file__} numpy {np.__version__} {np.__file__}"
+    f"lerobot+torch+robomimic ok {version} {torch.__file__} numpy {np.__version__} {np.__file__}"
 )' 2>&1)"; then
     lerobot_dlc_log "skip ${venv}: ${out}"
     return 1
@@ -297,7 +298,7 @@ lerobot_dlc_ensure_uv() {
 }
 
 lerobot_dlc_run_uv_sync() {
-  env -u UV_NO_SYNC uv sync --frozen --inexact --extra dataset --extra training "$@"
+  env -u UV_NO_SYNC uv sync --frozen --inexact --extra dataset --extra training --extra actioncodec "$@"
 }
 
 lerobot_dlc_sync_venv_dlc() {
@@ -438,7 +439,7 @@ PY
     lerobot_dlc_log "reusing ${selected} (no uv install, no uv sync, no PyPI)"
   else
     if [[ "${SKIP_UV_SYNC:-0}" == "1" ]]; then
-      echo "[error] no reusable venv (need import lerobot + torch 2.7.x + torch.from_numpy) and SKIP_UV_SYNC=1" >&2
+      echo "[error] no reusable venv (need lerobot + robomimic + torch 2.7.x + torch.from_numpy) and SKIP_UV_SYNC=1" >&2
       return 1
     fi
     LEROBOT_DLC_SYNC_REASON="${LEROBOT_DLC_SYNC_REASON:-venv missing or probe failed}"
@@ -472,7 +473,9 @@ if find_spec("torchvision") is None:
     raise SystemExit("torchvision missing; image system-site-packages not visible")
 if find_spec("lerobot") is None:
     raise SystemExit("lerobot missing after bootstrap")
-print("torchvision ok, lerobot ok, numpy", np.__version__, np.__file__)
+if find_spec("robomimic") is None:
+    raise SystemExit("robomimic missing; bootstrap with the actioncodec extra")
+print("torchvision ok, lerobot ok, robomimic ok, numpy", np.__version__, np.__file__)
 PY
 }
 
@@ -568,7 +571,7 @@ lerobot_dlc_train_policy() {
   lerobot_dlc_log "policy repo=${ROBOCASA_REPO_ID} root=${ROBOCASA_V3_DATASET} action_dim=${action_dim} num_tasks=${num_tasks} tokenizer=${tokenizer_path} steps=${POLICY_STEPS}"
   # UserCommand 里不要用反斜杠续行；这里已经是单行。
   # shellcheck disable=SC2086
-  "${python}" -m lerobot.scripts.lerobot_train --dataset.repo_id="${ROBOCASA_REPO_ID}" --dataset.root="${ROBOCASA_V3_DATASET}" --policy.type=actioncodec --policy.action_dim="${action_dim}" --policy.num_tasks="${num_tasks}" --policy.tokenizer_path="${tokenizer_path}" --policy.push_to_hub=false --policy.device=cuda --output_dir="${output_dir}" --job_name="actioncodec-${ROBOCASA_TASK:-CloseDrawer}" --steps="${POLICY_STEPS}" --batch_size="${BATCH_SIZE}" --num_workers="${NUM_WORKERS}" --log_freq=10 --save_freq="${POLICY_STEPS}" --env_eval_freq=0 --save_checkpoint=true --ema.enable=true --ema.power=0.75 --ema.max_decay=0.9999 --accelerator.mixed_precision=bf16 ${wandb_flags}
+  "${python}" -m lerobot.scripts.lerobot_train --dataset.repo_id="${ROBOCASA_REPO_ID}" --dataset.root="${ROBOCASA_V3_DATASET}" --policy.type=actioncodec --policy.action_dim="${action_dim}" --policy.num_tasks="${num_tasks}" --policy.tokenizer_path="${tokenizer_path}" --policy.vision_encoder=oat_exact_robomimic --policy.crop_shape='[76,76]' --policy.push_to_hub=false --policy.device=cuda --output_dir="${output_dir}" --job_name="actioncodec-${ROBOCASA_TASK:-CloseDrawer}" --steps="${POLICY_STEPS}" --batch_size="${BATCH_SIZE}" --num_workers="${NUM_WORKERS}" --log_freq=10 --save_freq="${POLICY_STEPS}" --env_eval_freq=0 --save_checkpoint=true --ema.enable=true --ema.power=0.75 --ema.max_decay=0.9999 --accelerator.mixed_precision=bf16 ${wandb_flags}
   test -d "${output_dir}/checkpoints/last/pretrained_model"
   lerobot_dlc_log "POLICY_OK ${output_dir}/checkpoints/last/pretrained_model"
 }

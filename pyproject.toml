@@ -205,6 +205,7 @@ intelrealsense = [
 phone = ["hebi-py>=2.8.0,<2.12.0", "teleop>=0.1.0,<0.2.0", "fastapi<1.0", "lerobot[scipy-dep]"]
 
 # Policies
+actioncodec = ["robomimic==0.2.0"]
 diffusion = ["lerobot[diffusers-dep]"]
 wallx = [
     "lerobot[transformers-dep]",
@@ -310,6 +311,7 @@ all = [
     "lerobot[rebot]",
     "lerobot[kinematics]",
     "lerobot[intelrealsense]",
+    "lerobot[actioncodec]",
     "lerobot[diffusion]",
     "lerobot[multi_task_dit]",
     "lerobot[wallx]",
@@ -375,6 +377,11 @@ explicit = true
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
 torchvision = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+
+[tool.uv]
+# robomimic declares egl-probe, but its vision modules never import it. egl-probe's legacy CMake
+# project does not configure under CMake 4, so omit that unused transitive dependency in uv envs.
+override-dependencies = ["egl-probe; python_version < '0'"]
 
 [tool.setuptools.package-data]
 lerobot = ["envs/*.json", "annotations/steerable_pipeline/prompts/*.txt"]
