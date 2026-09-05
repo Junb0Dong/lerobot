@@ -15,6 +15,11 @@
 
 </div>
 
+This fork's `real-robot` branch contains the XLeRobot ActionCodec workflows, including VQ/FSQ
+training and offline action-continuity evaluation. See the [script guide](scripts/README.md)
+for entry points and [current project status](agent_docs/04_xlerobot_actioncodec_status_0901.md)
+for model contracts and compatibility notes.
+
 **LeRobot** aims to provide models, datasets, and tools for real-world robotics in PyTorch. The goal is to lower the barrier to entry so that everyone can contribute to and benefit from shared datasets and pretrained models.
 
 🤗 A hardware-agnostic, Python-native interface that standardizes control across diverse platforms, from low-cost arms (SO-100) to humanoids.

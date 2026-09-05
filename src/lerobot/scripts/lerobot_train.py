@@ -45,6 +45,7 @@ from termcolor import colored
 from torch.optim import Optimizer
 from tqdm import tqdm
 
+from lerobot.common.tensorboard_utils import TensorBoardLogger
 from lerobot.common.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
@@ -57,7 +58,6 @@ from lerobot.common.train_utils import (
     should_save_checkpoint,
     update_last_checkpoint,
 )
-from lerobot.common.tensorboard_utils import TensorBoardLogger
 from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import JobConfig, parser
 from lerobot.configs.train import TrainPipelineConfig
@@ -100,6 +100,50 @@ from .lerobot_eval import eval_policy_all
 EMA_STATE_FILENAME = "ema_state.pt"
 
 
+class _ActionCodecPairedWindowDataset(torch.utils.data.Dataset):
+    """Episode-local policy view returning the anchor and its t+16 observation window."""
+
+    def __init__(self, dataset: Any, horizon: int = 20, shift: int = 16, stride: int = 4) -> None:
+        self.dataset = dataset
+        self.meta = dataset.meta
+        self.episodes = dataset.episodes
+        self.pairs: list[tuple[int, int]] = []
+        episode_table = dataset.meta.episodes
+        selected = (
+            range(len(episode_table["dataset_from_index"])) if dataset.episodes is None else dataset.episodes
+        )
+        absolute_to_relative = dataset.absolute_to_relative_idx
+        for episode_index in selected:
+            start = int(episode_table["dataset_from_index"][episode_index])
+            end = int(episode_table["dataset_to_index"][episode_index])
+            for absolute_start in range(start, end - horizon - shift + 1, stride):
+                first = (
+                    absolute_start if absolute_to_relative is None else absolute_to_relative[absolute_start]
+                )
+                second_absolute = absolute_start + shift
+                second = (
+                    second_absolute if absolute_to_relative is None else absolute_to_relative[second_absolute]
+                )
+                self.pairs.append((first, second))
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, index: int) -> tuple[dict[str, Any], dict[str, Any]]:
+        first, second = self.pairs[index]
+        return self.dataset[first], self.dataset[second]
+
+
+def _collate_actioncodec_pairs(
+    batch: list[tuple[dict[str, Any], dict[str, Any]]],
+) -> dict[str, Any]:
+    first, second = zip(*batch, strict=True)
+    return {
+        "_actioncodec_anchor": lerobot_collate_fn(list(first)),
+        "_actioncodec_pair": lerobot_collate_fn(list(second)),
+    }
+
+
 @contextmanager
 def _ema_weights(ema: Any, policy: PreTrainedPolicy) -> Iterator[None]:
     """Temporarily swap the EMA shadow weights into `policy`, restoring the live ones on exit."""
@@ -133,6 +177,14 @@ def _preprocess_dataset_batch(
     preprocessor: Any,
 ) -> Any:
     """Prepare a raw dataset batch identically for training and held-out evaluation."""
+    if "_actioncodec_anchor" in batch:
+        anchor = _preprocess_dataset_batch(
+            batch["_actioncodec_anchor"], camera_keys, rename_map, preprocessor
+        )
+        anchor["_actioncodec_pair"] = _preprocess_dataset_batch(
+            batch["_actioncodec_pair"], camera_keys, rename_map, preprocessor
+        )
+        return anchor
     for cam_key in camera_keys:
         if cam_key in batch and batch[cam_key].dtype == torch.uint8:
             batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
@@ -218,6 +270,12 @@ def update_policy(
 
             # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
+        fsq_training = (
+            getattr(accelerator.unwrap_model(policy).config, "quantizer_type", None) == "semantic_fsq"
+        )
+        if fsq_training and not torch.isfinite(loss):
+            raise FloatingPointError("FSQ policy non-finite loss")
+
         # Use accelerator's backward method
         accelerator.backward(loss)
 
@@ -227,6 +285,9 @@ def update_policy(
         grad_norm = None
         if accelerator.sync_gradients and grad_clip_norm > 0:
             grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+
+        if fsq_training and grad_norm is not None and not torch.isfinite(grad_norm):
+            raise FloatingPointError("FSQ policy non-finite gradient")
 
         # Optimizer step (a no-op on non-final micro-batches under gradient accumulation)
         with lock if lock is not None else nullcontext():
@@ -284,7 +345,28 @@ def make_dataloaders(
         dataloader and the eval dataloader (None when no eval split exists).
     """
     active_cfg = cfg.trainable_config
-    if not cfg.dataset.streaming:
+    pair_enabled = (
+        getattr(active_cfg, "decoded_overlap_loss_weight", 0.0) > 0
+        or getattr(active_cfg, "decoded_seam_loss_weight", 0.0) > 0
+    )
+    if pair_enabled:
+        if cfg.dataset.streaming:
+            raise ValueError("ActionCodec overlap/seam losses require a map-style episode dataset")
+        dataset = _ActionCodecPairedWindowDataset(
+            dataset,
+            horizon=getattr(active_cfg, "horizon", 20),
+            shift=getattr(active_cfg, "overlap_shift", 16),
+        )
+        if eval_dataset is not None:
+            eval_dataset = _ActionCodecPairedWindowDataset(
+                eval_dataset,
+                horizon=getattr(active_cfg, "horizon", 20),
+                shift=getattr(active_cfg, "overlap_shift", 16),
+            )
+    if pair_enabled:
+        shuffle = True
+        sampler = None
+    elif not cfg.dataset.streaming:
         # All non-streaming (map-style) datasets use EpisodeAwareSampler.
         # The order is a pure function of (seed, epoch), so every rank independently produces the
         # same permutation. accelerate then shards it disjointly across data-parallel ranks via
@@ -337,7 +419,11 @@ def make_dataloaders(
     # Only swap in the language-aware collate when the dataset actually
     # declares language columns; otherwise stay on PyTorch's default
     # collate so non-language training runs are unaffected.
-    collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
+    collate_fn = (
+        _collate_actioncodec_pairs
+        if pair_enabled
+        else (lerobot_collate_fn if dataset.meta.has_language_columns else None)
+    )
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.num_workers,
@@ -356,7 +442,11 @@ def make_dataloaders(
     eval_dataloader = None
     if eval_dataset is not None:
         eval_ds = eval_dataset
-        if cfg.max_eval_samples > 0 and hasattr(eval_dataset, "hf_dataset"):
+        if cfg.max_eval_samples > 0 and pair_enabled:
+            eval_ds = torch.utils.data.Subset(
+                eval_dataset, range(min(cfg.max_eval_samples, len(eval_dataset)))
+            )
+        elif cfg.max_eval_samples > 0 and hasattr(eval_dataset, "hf_dataset"):
             task_arr = eval_dataset.hf_dataset.data.column("task_index").to_numpy()
             unique_tasks = sorted(set(task_arr.tolist()))
             per_task = max(1, cfg.max_eval_samples // len(unique_tasks))
@@ -366,7 +456,11 @@ def make_dataloaders(
                 selected.extend(frames.tolist())
             eval_ds = torch.utils.data.Subset(eval_dataset, selected)
 
-        eval_collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
+        eval_collate_fn = (
+            _collate_actioncodec_pairs
+            if pair_enabled
+            else (lerobot_collate_fn if dataset.meta.has_language_columns else None)
+        )
         eval_dataloader = torch.utils.data.DataLoader(
             eval_ds,
             batch_size=cfg.batch_size,
@@ -790,23 +884,30 @@ def train(cfg: TrainPipelineConfig):
             policy.eval()
             eval_loss_sum = 0.0
             n_eval_batches = 0
+            eval_metric_sums: dict[str, float] = {}
             with torch.no_grad(), accelerator.autocast():
                 for eval_batch in eval_dataloader:
                     eval_batch = _preprocess_dataset_batch(
                         eval_batch, dataset.meta.camera_keys, cfg.rename_map, preprocessor
                     )
-                    loss, _ = policy(eval_batch)  # __call__, so FSDP2 forward hooks run
+                    loss, metrics = policy(eval_batch)  # __call__, so FSDP2 forward hooks run
                     eval_loss_sum += loss.item()
+                    for key, value in metrics.items():
+                        eval_metric_sums[key] = eval_metric_sums.get(key, 0.0) + float(value)
                     n_eval_batches += 1
             eval_loss = eval_loss_sum / max(n_eval_batches, 1)
             eval_loss = torch.tensor(eval_loss, device=device)
             eval_loss = accelerator.reduce(eval_loss, reduction="mean").item()
+            eval_metrics = {"eval_loss": eval_loss}
+            for key, value in eval_metric_sums.items():
+                metric = torch.tensor(value / max(n_eval_batches, 1), device=device)
+                eval_metrics[key] = accelerator.reduce(metric, reduction="mean").item()
             policy.train()
 
             if is_main_process():
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
                 for logger in loggers:
-                    logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
+                    logger.log_dict(eval_metrics, step=step, mode="eval")
 
         if cfg.save_checkpoint and is_saving_step:
             # Collective: every rank participates (gathers / DCP shard writes); rank-0-only file

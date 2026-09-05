@@ -175,6 +175,8 @@ outputs/
 
 # Dev folders
 .cache/*
+# Local network tooling, unrelated to LeRobot (may contain private configuration).
+/clash-for-linux-install/
 *.stl
 *.urdf
 *.xml

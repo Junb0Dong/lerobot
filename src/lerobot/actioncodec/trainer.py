@@ -66,6 +66,12 @@ class SemanticTokenizerTrainConfig:
             ``0`` turns alignment off.
         hard_alignment_weight: Weight of the older hard-DTW alignment (``weight_align``). Default
             ``0``; keep it off unless you explicitly want both.
+        overlap_consistency_weight: Weight of the paired-window physical overlap loss.
+        overlap_shift: Shift between paired windows in frames.
+        physical_recon_weight: Weight of physical action reconstruction loss.
+        physical_velocity_weight: Weight of physical action velocity loss.
+        physical_unit_scale: Raw action units represented by one loss unit.
+        continuous_action_indices: Action dimensions included in physical smoothness losses.
         decoder_type: ``"diffusion"`` (default) or ``"perceiver"``.
         diffusion_config: Extra keyword arguments for the diffusion decoder.
         log_freq: Number of steps between training log lines; ``0`` disables logging.
@@ -85,6 +91,8 @@ class SemanticTokenizerTrainConfig:
     action_horizon: int = 20
     latent_horizon: int = 16
     codebook_size: int = 1024
+    quantizer_type: str = "vq"
+    fsq_levels: tuple[int, ...] = (8, 5, 5, 5)
     num_codebooks: int = 1
     encoder_cross_layers: int = 8
     decoder_cross_layers: int = 8
@@ -101,12 +109,41 @@ class SemanticTokenizerTrainConfig:
     lr_warmup_steps: int = 1000
     lr_min_ratio: float = 0.1
     amp: bool = True
+    amp_dtype: str = "float16"
     occupancy_window: int = 2000
     alignment_weight: float = 0.1
     hard_alignment_weight: float = 0.0
+    overlap_consistency_weight: float = 0.0
+    overlap_shift: int = 16
+    physical_recon_weight: float = 0.0
+    physical_velocity_weight: float = 0.0
+    physical_unit_scale: float = 1.0
+    continuous_action_indices: tuple[int, ...] | None = None
     decoder_type: str = "diffusion"
     diffusion_config: dict[str, object] | None = None
     log_freq: int = 10
+
+    def __post_init__(self) -> None:
+        """Normalize and validate the optional physical continuity settings."""
+        if self.amp_dtype not in {"float16", "bfloat16"}:
+            raise ValueError("amp_dtype must be float16 or bfloat16")
+        if self.continuous_action_indices is not None:
+            self.continuous_action_indices = tuple(int(index) for index in self.continuous_action_indices)
+        for name in ("overlap_consistency_weight", "physical_recon_weight", "physical_velocity_weight"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if self.overlap_consistency_weight > 0 and not 0 < self.overlap_shift < self.action_horizon:
+            raise ValueError(
+                "overlap_shift must satisfy 0 < overlap_shift < action_horizon when overlap is enabled"
+            )
+        if self.overlap_consistency_weight > 0 and self.batch_size % 2:
+            raise ValueError("batch_size must be even when overlap consistency is enabled")
+        if self.physical_unit_scale <= 0:
+            raise ValueError("physical_unit_scale must be positive")
+        if self.continuous_action_indices is not None and any(
+            index < 0 or index >= self.action_dim for index in self.continuous_action_indices
+        ):
+            raise ValueError("continuous_action_indices must be valid action dimensions")
 
     def alignment_loss_config(self) -> dict[str, object]:
         """Map CLI weights onto the tokenizer ``loss_config`` keys.
@@ -129,6 +166,12 @@ class SemanticTokenizerTrainConfig:
             "chunk_align_max_candidate_pairs": 1024,
             "chunk_align_min_delta_norm": 1e-6,
             "chunk_align_normalize_delta": True,
+            "overlap_consistency_weight": self.overlap_consistency_weight,
+            "overlap_shift": self.overlap_shift,
+            "physical_recon_weight": self.physical_recon_weight,
+            "physical_velocity_weight": self.physical_velocity_weight,
+            "physical_unit_scale": self.physical_unit_scale,
+            "continuous_action_indices": self.continuous_action_indices,
         }
 
     def to_tokenizer_config(self) -> ActionCodecTokenizerConfig:
@@ -147,6 +190,8 @@ class SemanticTokenizerTrainConfig:
             horizon=self.action_horizon,
             latent_horizon=self.latent_horizon,
             model_dim=self.model_dim,
+            quantizer_type=self.quantizer_type,
+            fsq_levels=self.fsq_levels,
             codebook_size=self.codebook_size,
             num_codebooks=self.num_codebooks,
             encoder_cross_layers=self.encoder_cross_layers,
@@ -158,9 +203,16 @@ class SemanticTokenizerTrainConfig:
             vq_beta=self.vq_beta,
             use_vl_embedder=self.use_vl_embedder,
             window_stride=self.window_stride,
+            overlap_consistency_weight=self.overlap_consistency_weight,
+            overlap_shift=self.overlap_shift,
+            physical_recon_weight=self.physical_recon_weight,
+            physical_velocity_weight=self.physical_velocity_weight,
+            physical_unit_scale=self.physical_unit_scale,
+            continuous_action_indices=self.continuous_action_indices,
             decoder_type=self.decoder_type,
             diffusion_config=self.diffusion_config,
             learning_rate=self.learning_rate,
+            amp_dtype=self.amp_dtype,
             device=self.device,
             steps=self.steps,
             batch_size=self.batch_size,
@@ -251,6 +303,51 @@ def _window_start_indices(
     return starts
 
 
+def _paired_window_start_indices(
+    from_index: Sequence[int],
+    to_index: Sequence[int],
+    horizon: int,
+    shift: int,
+    stride: int,
+) -> list[int]:
+    """Return starts whose ``t:t+horizon`` and ``t+shift:t+shift+horizon`` fit one episode."""
+    if horizon <= 0 or stride <= 0 or not 0 < shift < horizon:
+        raise ValueError("horizon and stride must be positive and shift must satisfy 0 < shift < horizon")
+    starts: list[int] = []
+    for start, end in zip(_as_int_list(from_index), _as_int_list(to_index), strict=True):
+        last = int(end) - int(horizon) - int(shift)
+        starts.extend(range(int(start), last + 1, int(stride)))
+    if not starts:
+        raise ValueError(
+            f"No full paired horizon={horizon}, shift={shift} windows remain; check episode lengths"
+        )
+    return starts
+
+
+class PairedWindowDataset(torch.utils.data.Dataset):
+    """Expose two episode-local action windows as ``[A, B]`` for a paired batch."""
+
+    def __init__(self, dataset: torch.utils.data.Dataset, starts: Sequence[int], shift: int) -> None:
+        """Build a pair view over a horizon-window dataset and absolute frame starts."""
+        self.dataset = dataset
+        self.starts = list(starts)
+        self.shift = int(shift)
+
+    def __len__(self) -> int:
+        """Return the number of paired window starts."""
+        return len(self.starts)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        """Return ``t`` and ``t+shift`` stacked along a pair dimension."""
+        start = self.starts[index]
+        first = self.dataset[start]
+        second = self.dataset[start + self.shift]
+        item = {"action": torch.stack((first["action"], second["action"]))}
+        if "observation.state" in first and "observation.state" in second:
+            item["observation.state"] = torch.stack((first["observation.state"], second["observation.state"]))
+        return item
+
+
 def _resolve_window_indices(dataset: object, horizon: int, stride: int) -> list[int] | None:
     """Read episode bounds off a LeRobotDataset when they exist; otherwise return ``None``."""
     episodes = getattr(getattr(dataset, "meta", None), "episodes", None)
@@ -299,7 +396,9 @@ def train_semantic_tokenizer(cfg: SemanticTokenizerTrainConfig) -> Path:
 
     Actions are normalized with the dataset mean and std exactly the way the policy processor does
     at inference, then reconstructed through the quantizer for ``cfg.steps`` optimizer steps,
-    cycling the dataloader as many times as needed. When ``alignment_weight`` is positive the
+    cycling the dataloader as many times as needed. When overlap consistency is enabled, the
+    dataloader returns episode-local ``t``/``t+overlap_shift`` pairs and concatenates them as
+    ``[A_batch, B_batch]`` before the model forward. When ``alignment_weight`` is positive the
     normalized action window is fed to soft-DTW; hard-DTW still uses state deltas when
     ``hard_alignment_weight`` is positive. Scalars are written to ``{output_dir}/tb``.
     On completion the checkpoint directory holds ``model.safetensors``, ``model_config.json``,
@@ -335,15 +434,29 @@ def train_semantic_tokenizer(cfg: SemanticTokenizerTrainConfig) -> Path:
         decode_videos=False,
     )
     logging.info("tokenizer dataloader skips video decode (action/state windows only)")
-    window_indices = _resolve_window_indices(dataset, config.horizon, cfg.window_stride)
-    train_data: torch.utils.data.Dataset = (
-        Subset(dataset, window_indices) if window_indices is not None else dataset
-    )
-    drop_last = len(train_data) >= config.batch_size
+    overlap_enabled = config.overlap_consistency_weight > 0
+    if overlap_enabled:
+        episodes = getattr(getattr(dataset, "meta", None), "episodes", None)
+        if episodes is None:
+            raise ValueError("Overlap consistency requires episode metadata for paired windows")
+        pair_indices = _paired_window_start_indices(
+            episodes["dataset_from_index"],
+            episodes["dataset_to_index"],
+            horizon=config.horizon,
+            shift=config.overlap_shift,
+            stride=config.window_stride,
+        )
+        train_data = PairedWindowDataset(dataset, pair_indices, config.overlap_shift)
+        loader_batch_size = config.batch_size // 2
+    else:
+        window_indices = _resolve_window_indices(dataset, config.horizon, config.window_stride)
+        train_data = Subset(dataset, window_indices) if window_indices is not None else dataset
+        loader_batch_size = config.batch_size
+    drop_last = len(train_data) >= loader_batch_size
     pin_memory = torch.device(config.device).type == "cuda"
     loader = DataLoader(
         train_data,
-        batch_size=config.batch_size,
+        batch_size=loader_batch_size,
         shuffle=True,
         num_workers=config.num_workers,
         drop_last=drop_last,
@@ -351,13 +464,15 @@ def train_semantic_tokenizer(cfg: SemanticTokenizerTrainConfig) -> Path:
     )
     if len(loader) == 0:
         raise ValueError(
-            f"Tokenizer dataloader is empty: {len(train_data)} windows, batch_size={config.batch_size}"
+            f"Tokenizer dataloader is empty: {len(train_data)} samples, batch_size={loader_batch_size}"
         )
     model = ActionCodecTokenizer(
         action_dim=config.action_dim,
         window_size=config.horizon,
         model_dim=config.model_dim,
         num_tokens=config.latent_horizon,
+        quantizer_type=config.quantizer_type,
+        fsq_levels=config.fsq_levels,
         codebook_size=config.codebook_size,
         num_codebooks=config.num_codebooks,
         num_heads=config.num_heads,
@@ -395,10 +510,13 @@ def train_semantic_tokenizer(cfg: SemanticTokenizerTrainConfig) -> Path:
     )
     device = torch.device(config.device)
     use_amp = bool(cfg.amp) and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    amp_dtype = getattr(torch, cfg.amp_dtype)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and amp_dtype == torch.float16)
     occupancy = CodebookOccupancyMeter(config.codebook_size, window=cfg.occupancy_window)
     output_dir = Path(cfg.output_dir)
     tb_logger = TensorBoardLogger.from_log_dir(output_dir / "tb")
+    stats = metadata.stats.get("action", {}) if metadata.stats else {}
+    action_std = torch.as_tensor(stats["std"], device=device, dtype=torch.float32)
     model.train()
     iterator = iter(loader)
     try:
@@ -408,22 +526,34 @@ def train_semantic_tokenizer(cfg: SemanticTokenizerTrainConfig) -> Path:
             except StopIteration:
                 iterator = iter(loader)
                 batch = next(iterator)
-            action = batch["action"].to(config.device, non_blocking=pin_memory).float()
-            action = _normalize_action(action, metadata.stats.get("action", {}) if metadata.stats else {})
+            action_batch = batch["action"].to(config.device, non_blocking=pin_memory).float()
+            if overlap_enabled:
+                action = torch.cat((action_batch[:, 0], action_batch[:, 1]), dim=0)
+            else:
+                action = action_batch
+            action = _normalize_action(action, stats)
             delta_state = None
             if cfg.hard_alignment_weight > 0:
-                state = batch["observation.state"].to(config.device, non_blocking=pin_memory).float()
+                state_batch = batch["observation.state"].to(config.device, non_blocking=pin_memory).float()
+                state = (
+                    torch.cat((state_batch[:, 0], state_batch[:, 1]), dim=0)
+                    if overlap_enabled
+                    else state_batch
+                )
                 delta_state = torch.cat((state[:, 1:] - state[:, :-1], state[:, -1:]), dim=1)
             elif cfg.alignment_weight > 0:
                 delta_state = action
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                output = model(
-                    action,
-                    delta_state=delta_state,
-                    loss_config=cfg.alignment_loss_config(),
-                )
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp, dtype=amp_dtype):
+                model_kwargs = {
+                    "delta_state": delta_state,
+                    "loss_config": cfg.alignment_loss_config(),
+                }
+                model_kwargs["action_std"] = action_std
+                output = model(action, **model_kwargs)
                 loss = output["loss"]
+            if config.quantizer_type == "semantic_fsq" and not torch.isfinite(loss):
+                raise FloatingPointError(f"FSQ non-finite loss at step {step}")
             if not torch.isfinite(loss):
                 model.quantizer.discard_pending_codebook_updates()
                 logging.warning("step: %d skipped non-finite loss", step)
@@ -431,7 +561,17 @@ def train_semantic_tokenizer(cfg: SemanticTokenizerTrainConfig) -> Path:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             if cfg.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            else:
+                gradient_norm = torch.sqrt(
+                    sum(
+                        parameter.grad.detach().float().pow(2).sum()
+                        for parameter in model.parameters()
+                        if parameter.grad is not None
+                    )
+                )
+            if config.quantizer_type == "semantic_fsq" and not torch.isfinite(gradient_norm):
+                raise FloatingPointError(f"FSQ non-finite gradient at step {step}")
             scale_before = float(scaler.get_scale())
             scaler.step(optimizer)
             scaler.update()
@@ -445,12 +585,17 @@ def train_semantic_tokenizer(cfg: SemanticTokenizerTrainConfig) -> Path:
             if cfg.log_freq > 0 and (step % cfg.log_freq == 0 or step + 1 == config.steps):
                 logging.info(
                     "step: %d loss: %.4f recon: %.4f vq: %.4f align: %.4f "
+                    "phys_recon: %.4f phys_velocity: %.4f overlap: %.4f grad_norm: %.4f "
                     "unique_codes_batch: %d occupied_window: %d occupied_total: %d usage_total: %.4f",
                     step,
                     float(output["loss"].item()),
                     float(output["loss_recon"].item()),
                     float(output["loss_vq"].item()),
                     float(output["loss_align"].item()),
+                    float(output["loss_phys_recon"].item()),
+                    float(output["loss_phys_velocity"].item()),
+                    float(output["loss_overlap"].item()),
+                    float(gradient_norm.item()),
                     int(occupancy_stats["unique_codes_batch"]),
                     int(occupancy_stats["codebook_occupied_window"]),
                     int(occupancy_stats["codebook_occupied_total"]),
@@ -462,13 +607,22 @@ def train_semantic_tokenizer(cfg: SemanticTokenizerTrainConfig) -> Path:
                         "loss_recon": float(output["loss_recon"].item()),
                         "loss_vq": float(output["loss_vq"].item()),
                         "loss_align": float(output["loss_align"].item()),
+                        "loss_phys_recon": float(output["loss_phys_recon"].item()),
+                        "loss_phys_velocity": float(output["loss_phys_velocity"].item()),
+                        "loss_overlap": float(output["loss_overlap"].item()),
+                        "weighted_phys_recon": float(output["weighted_phys_recon"].item()),
+                        "weighted_phys_velocity": float(output["weighted_phys_velocity"].item()),
+                        "weighted_overlap": float(output["weighted_overlap"].item()),
+                        "physical_recon_mae": float(output["physical_recon_mae"].item()),
+                        "physical_velocity_mae": float(output["physical_velocity_mae"].item()),
+                        "overlap_mae": float(output["overlap_mae"].item()),
+                        "grad_norm": float(gradient_norm.item()),
                         **occupancy_stats,
                     },
                     step=step,
                 )
     finally:
         tb_logger.close()
-    stats = metadata.stats.get("action", {}) if metadata.stats else {}
     contract = {
         "dataset_codebase_version": getattr(metadata, "_version", "v3.0").__str__(),
         "repo_id": cfg.repo_id,
@@ -478,6 +632,8 @@ def train_semantic_tokenizer(cfg: SemanticTokenizerTrainConfig) -> Path:
         "latent_horizon": config.latent_horizon,
         "action_dim": config.action_dim,
         "window_stride": cfg.window_stride,
+        "overlap_shift": config.overlap_shift,
+        "continuous_action_indices": config.continuous_action_indices,
     }
     save_tokenizer_artifact(output_dir, model, config, action_stats=stats, dataset_contract=contract)
     return output_dir

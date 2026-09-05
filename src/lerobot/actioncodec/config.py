@@ -59,6 +59,12 @@ class ActionCodecTokenizerConfig:
             style auxiliary loss. Default ``False``; CLIP is not part of the matched-h20 recipe.
         window_stride: Episode-local stride between tokenizer window starts. ``4`` matches the
             source HDF5 chunking; ``1`` is every frame.
+        overlap_consistency_weight: Weight of the paired-window physical overlap loss.
+        overlap_shift: Shift between paired windows in frames.
+        physical_recon_weight: Weight of physical action reconstruction loss.
+        physical_velocity_weight: Weight of physical action velocity loss.
+        physical_unit_scale: Raw action units represented by one loss unit.
+        continuous_action_indices: Action dimensions included in physical smoothness losses.
         learning_rate: AdamW learning rate used by the standalone trainer.
         weight_decay: AdamW weight decay used by the standalone trainer.
         device: Torch device string the trainer moves the model to.
@@ -76,6 +82,8 @@ class ActionCodecTokenizerConfig:
     latent_horizon: int = 16
     model_dim: int = 512
     codebook_size: int = 1024
+    quantizer_type: str = "vq"
+    fsq_levels: tuple[int, ...] = (8, 5, 5, 5)
     num_codebooks: int = 1
     num_heads: int = 8
     encoder_layers: int = 3
@@ -97,8 +105,15 @@ class ActionCodecTokenizerConfig:
     diffusion_config: dict[str, Any] | None = None
     use_vl_embedder: bool = False
     window_stride: int = 4
+    overlap_consistency_weight: float = 0.0
+    overlap_shift: int = 16
+    physical_recon_weight: float = 0.0
+    physical_velocity_weight: float = 0.0
+    physical_unit_scale: float = 1.0
+    continuous_action_indices: tuple[int, ...] | None = None
     learning_rate: float = 2e-4
     weight_decay: float = 0.0
+    amp_dtype: str = "float16"
     device: str = "cpu"
     steps: int = 20000
     batch_size: int = 512
@@ -106,6 +121,11 @@ class ActionCodecTokenizerConfig:
     seed: int = 42
     action_key: str = "action"
     delta_state_key: str = "delta_state"
+
+    def __post_init__(self) -> None:
+        """Store parsed action indices in the tuple form used by the artifact contract."""
+        if self.continuous_action_indices is not None:
+            self.continuous_action_indices = tuple(int(index) for index in self.continuous_action_indices)
 
     def validate(self) -> None:
         """Check the fields that the token vocabulary and the policy interface depend on.
@@ -116,8 +136,14 @@ class ActionCodecTokenizerConfig:
         """
         if self.horizon != 20 or self.latent_horizon != 16:
             raise ValueError("ActionCodec semantic contract requires horizon=20 and latent_horizon=16")
-        if self.codebook_size != 1024 or self.num_codebooks != 1:
-            raise ValueError("ActionCodec semantic contract requires one codebook with vocab_size=1024")
+        self.fsq_levels = tuple(self.fsq_levels)
+        if self.quantizer_type not in {"vq", "semantic_fsq"}:
+            raise ValueError(f"Unsupported quantizer_type: {self.quantizer_type}")
+        if self.quantizer_type == "semantic_fsq" and self.fsq_levels != (8, 5, 5, 5):
+            raise ValueError("semantic_fsq requires fsq_levels=[8,5,5,5]")
+        expected_vocab = 1000 if self.quantizer_type == "semantic_fsq" else 1024
+        if self.codebook_size != expected_vocab or self.num_codebooks != 1:
+            raise ValueError(f"ActionCodec requires one codebook with vocab_size={expected_vocab}")
         if self.action_dim <= 0 or self.model_dim <= 0:
             raise ValueError("action_dim and model_dim must be positive")
         if self.decoder_type not in {"perceiver", "diffusion"}:
@@ -126,6 +152,20 @@ class ActionCodecTokenizerConfig:
             raise ValueError("soft_assignment_temperature must be positive")
         if self.window_stride <= 0:
             raise ValueError("window_stride must be positive")
+        for name in ("overlap_consistency_weight", "physical_recon_weight", "physical_velocity_weight"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if self.overlap_consistency_weight > 0 and not 0 < self.overlap_shift < self.horizon:
+            raise ValueError("overlap_shift must satisfy 0 < overlap_shift < horizon when overlap is enabled")
+        if self.overlap_consistency_weight > 0 and self.batch_size % 2:
+            raise ValueError("batch_size must be even when overlap consistency is enabled")
+        if self.physical_unit_scale <= 0:
+            raise ValueError("physical_unit_scale must be positive")
+        if self.continuous_action_indices is not None:
+            if not self.continuous_action_indices:
+                raise ValueError("continuous_action_indices must not be empty")
+            if any(index < 0 or index >= self.action_dim for index in self.continuous_action_indices):
+                raise ValueError("continuous_action_indices must be valid action dimensions")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the configuration after re-checking the semantic contract.

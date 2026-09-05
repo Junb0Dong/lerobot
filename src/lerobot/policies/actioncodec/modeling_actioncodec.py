@@ -14,6 +14,7 @@ import torch.nn.functional as F  # noqa: N812
 from safetensors.torch import load_file
 
 from lerobot.actioncodec.config import load_tokenizer_config
+from lerobot.actioncodec.models.fsq import FSQGrid
 from lerobot.actioncodec.models.tokenizer import ActionCodecTokenizer
 from lerobot.lerobot_types import PolicyAction
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -30,6 +31,11 @@ class FrozenTokenizerAdapter(nn.Module):
         super().__init__()
         if config.tokenizer_path is not None:
             tokenizer_config = load_tokenizer_config(config.tokenizer_path)
+            if tokenizer_config.quantizer_type != config.quantizer_type or (
+                config.quantizer_type == "semantic_fsq"
+                and tokenizer_config.fsq_levels != tuple(config.fsq_levels)
+            ):
+                raise ValueError("Tokenizer quantizer_type/fsq_levels does not match policy config")
             contract_path = Path(config.tokenizer_path) / "dataset_contract.json"
             stats_path = Path(config.tokenizer_path) / "action_stats.json"
             if not contract_path.is_file() or not stats_path.is_file():
@@ -69,6 +75,8 @@ class FrozenTokenizerAdapter(nn.Module):
             window_size=config.horizon,
             model_dim=256 if tokenizer_config is None else tokenizer_config.model_dim,
             num_tokens=config.latent_horizon,
+            quantizer_type=config.quantizer_type,
+            fsq_levels=config.fsq_levels,
             codebook_size=config.codebook_size,
             num_codebooks=config.num_codebooks,
             num_heads=8 if tokenizer_config is None else tokenizer_config.num_heads,
@@ -128,6 +136,70 @@ class FrozenTokenizerAdapter(nn.Module):
     @torch.inference_mode()
     def detokenize(self, tokens: torch.Tensor) -> torch.Tensor:
         return self.model.detokenize(tokens)
+
+    def decode_train(self, latents: torch.Tensor) -> torch.Tensor:
+        """Decode continuous latents without disabling gradients to the policy inputs."""
+        return self.model.decode_train(latents)[..., : self.action_dim]
+
+    @property
+    def codebook_weight(self) -> torch.Tensor:
+        return self.model.quantizer.codebooks[0].weight
+
+
+def _codebook_distance_loss(
+    logits: torch.Tensor, target: torch.Tensor, codebook: torch.Tensor
+) -> torch.Tensor:
+    """Expected squared code distance, normalized by the mean over all code pairs.
+
+    Exclude BOS, freeze the tokenizer geometry, and use FP32 even under AMP.
+    This is E[distance(code, target)], not distance(E[code], target).
+    """
+    with torch.autocast(device_type=logits.device.type, enabled=False):
+        weight = codebook.detach().float()
+        weight = weight - weight.mean(dim=0)
+        target_weight = F.embedding(target, weight)
+        distances = (
+            target_weight.square().sum(-1, keepdim=True)
+            + weight.square().sum(-1)
+            - 2 * target_weight @ weight.t()
+        ).clamp_min(0)
+        distances.scatter_(-1, target.unsqueeze(-1), 0)
+        mean_pair_distance = 2 * weight.square().sum(-1).mean()
+        probabilities = logits[..., : weight.shape[0]].float().softmax(-1)
+        return (probabilities * (distances / mean_pair_distance)).sum(-1).mean()
+
+
+def _relaxed_one_hot(
+    logits: torch.Tensor,
+    temperature: float,
+    generator: torch.Generator | None = None,
+    stochastic: bool = True,
+) -> torch.Tensor:
+    values = logits.float()
+    if stochastic:
+        uniform = torch.rand(values.shape, device=values.device, generator=generator)
+        gumbel = -torch.log(-torch.log(uniform.clamp_min(1e-6)))
+        soft = F.softmax((values + gumbel) / float(temperature), dim=-1)
+    else:
+        soft = F.softmax(values / float(temperature), dim=-1)
+    hard = F.one_hot(soft.argmax(dim=-1), values.shape[-1]).to(soft)
+    return hard + soft - soft.detach()
+
+
+def _continuous_indices(
+    action_dim: int, indices: tuple[int, ...] | None, device: torch.device
+) -> torch.Tensor:
+    if indices is None:
+        return torch.arange(action_dim, device=device)
+    return torch.as_tensor(indices, device=device, dtype=torch.long)
+
+
+def _physical_loss(
+    error: torch.Tensor, indices: torch.Tensor, unit_scale: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    selected = error.index_select(-1, indices).float()
+    loss = F.smooth_l1_loss(selected / float(unit_scale), torch.zeros_like(selected))
+    return loss, selected.abs().mean()
 
 
 def _token_metrics(logits: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
@@ -256,11 +328,73 @@ class OATExactCached(nn.Module):
     def forward(self, input_ids: torch.Tensor, cond: torch.Tensor, task_ids: torch.Tensor) -> torch.Tensor:
         if input_ids.shape[1] > self.max_seq_len:
             raise ValueError("token sequence exceeds max_seq_len")
-        x = self.drop(self.token_emb(input_ids) + self.token_pos_emb[:, : input_ids.shape[1]])
+        return self.forward_embeddings(self.token_emb(input_ids), cond, task_ids)
+
+    def forward_embeddings(
+        self, embeddings: torch.Tensor, cond: torch.Tensor, task_ids: torch.Tensor
+    ) -> torch.Tensor:
+        if embeddings.shape[1] > self.max_seq_len:
+            raise ValueError("token sequence exceeds max_seq_len")
+        x = self.drop(embeddings + self.token_pos_emb[:, : embeddings.shape[1]])
         memory = self._memory(cond, task_ids)
         for block in self.blocks:
             x, _ = block(x, memory)
         return self.head(self.norm(x))
+
+    def generate_differentiable(
+        self,
+        bos_embedding: torch.Tensor,
+        cond: torch.Tensor,
+        max_new_tokens: int,
+        task_ids: torch.Tensor,
+        codebook_weight: torch.Tensor,
+        temperature: float,
+        prefix_tokens: torch.Tensor,
+        prefix_corruption_prob: float,
+        seed: int,
+        stochastic: bool,
+    ) -> torch.Tensor:
+        """Generate ST token embeddings and codebook latents through the causal KV cache."""
+        memory = self._memory(cond, task_ids)
+        memory_cache = [block.memory_kv(memory) for block in self.blocks]
+        x = self.drop(bos_embedding + self.token_pos_emb[:, :1])
+        past = []
+        for block, cache in zip(self.blocks, memory_cache, strict=True):
+            x, present = block(x, memory, memory_kv=cache)
+            past.append(present)
+        logits = self.head(self.norm(x[:, -1:]))[:, 0, : self.generation_vocab_size]
+        generator = torch.Generator(device=logits.device)
+        generator.manual_seed(int(seed))
+        latents = []
+        for index in range(max_new_tokens):
+            probabilities = _relaxed_one_hot(
+                logits,
+                temperature,
+                generator=generator,
+                stochastic=stochastic,
+            )
+            latents.append(probabilities @ codebook_weight)
+            if index + 1 == max_new_tokens:
+                break
+            generated_embedding = (
+                probabilities @ self.token_emb.weight[: self.generation_vocab_size]
+            ).unsqueeze(1)
+            target_embedding = self.token_emb(prefix_tokens[:, index : index + 1])
+            if prefix_corruption_prob <= 0:
+                next_embedding = target_embedding
+            elif prefix_corruption_prob >= 1:
+                next_embedding = generated_embedding
+            else:
+                use_generated = torch.rand(
+                    (logits.shape[0], 1, 1), device=logits.device, generator=generator
+                ) < float(prefix_corruption_prob)
+                next_embedding = torch.where(use_generated, generated_embedding, target_embedding)
+            position = index + 1
+            x = self.drop(next_embedding + self.token_pos_emb[:, position : position + 1])
+            for layer, block in enumerate(self.blocks):
+                x, past[layer] = block(x, memory, past[layer], memory_cache[layer])
+            logits = self.head(self.norm(x))[:, 0, : self.generation_vocab_size]
+        return torch.stack(latents, dim=1)
 
     @torch.inference_mode()
     def sequence_logprobs(
@@ -321,6 +455,102 @@ class OATExactCached(nn.Module):
         return result
 
 
+class _FSQInput(nn.Module):
+    def __init__(self, dim, levels):
+        super().__init__()
+        self.grid = FSQGrid(levels)
+        self.projection = nn.Linear(4, dim)
+        self.bos = nn.Parameter(torch.zeros(1, 1, dim))
+        nn.init.normal_(self.bos, std=0.02)
+
+    def forward(self, ids):
+        coordinates = self.grid.indices_to_coordinates(ids)
+        return torch.where(ids[..., None] == 1000, self.bos, self.projection(coordinates))
+
+
+class _FSQHeads(nn.Module):
+    def __init__(self, dim, levels):
+        super().__init__()
+        self.heads = nn.ModuleList([nn.Linear(dim, level, bias=False) for level in levels])
+
+    def forward(self, x):
+        return tuple(head(x) for head in self.heads)
+
+
+def _scalar_ce(logits, classes):
+    return torch.stack(
+        [
+            F.cross_entropy(head.reshape(-1, head.shape[-1]), classes[..., i].reshape(-1))
+            for i, head in enumerate(logits)
+        ]
+    )
+
+
+class FSQOATExactCached(OATExactCached):
+    """Four independent scalar heads per causal position, sharing OAT attention/cache."""
+
+    def __init__(self, config, cond_dim):
+        super().__init__(config, cond_dim)
+        self.token_emb = _FSQInput(config.embed_dim, config.fsq_levels)
+        self.head = _FSQHeads(config.embed_dim, config.fsq_levels)
+        for module in (self.token_emb.projection, *self.head.heads):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    @torch.inference_mode()
+    def generate(self, input_ids, cond, max_new_tokens, task_ids, temperature=0.0, top_k=0):
+        if input_ids.shape[1] + max_new_tokens > self.max_seq_len:
+            raise ValueError("token sequence exceeds max_seq_len")
+        memory = self._memory(cond, task_ids)
+        memory_cache = [block.memory_kv(memory) for block in self.blocks]
+        x = self.drop(self.token_emb(input_ids) + self.token_pos_emb[:, : input_ids.shape[1]])
+        past = []
+        for block, cache in zip(self.blocks, memory_cache, strict=True):
+            x, present = block(x, memory, memory_kv=cache)
+            past.append(present)
+        result = input_ids
+        for index in range(max_new_tokens):
+            logits = self.head(self.norm(x[:, -1:]))
+            classes = []
+            for head in logits:
+                scores = head[:, -1].float()
+                if temperature > 0:
+                    scores = scores / temperature
+                    if 0 < top_k < scores.shape[-1]:
+                        threshold = scores.topk(top_k, dim=-1).values[:, -1:]
+                        scores = scores.masked_fill(scores < threshold, -float("inf"))
+                    classes.append(torch.multinomial(scores.softmax(-1), 1).squeeze(-1))
+                else:
+                    classes.append(scores.argmax(-1))
+            next_id = self.token_emb.grid.scalar_classes_to_indices(torch.stack(classes, -1))[:, None]
+            result = torch.cat((result, next_id), dim=1)
+            if index + 1 == max_new_tokens:
+                break
+            position = input_ids.shape[1] + index
+            x = self.drop(self.token_emb(next_id) + self.token_pos_emb[:, position : position + 1])
+            for layer, block in enumerate(self.blocks):
+                x, past[layer] = block(x, memory, past[layer], memory_cache[layer])
+        return result
+
+    @torch.inference_mode()
+    def sequence_logprobs(self, generated_ids, cond, task_ids, eos_id=None):
+        if eos_id is not None:
+            raise ValueError("FSQ uses a fixed horizon without EOS")
+        logits = self(generated_ids[:, :-1], cond, task_ids)
+        classes = self.token_emb.grid.indices_to_scalar_classes(generated_ids[:, 1:])
+        return (
+            torch.stack(
+                [
+                    head.float().log_softmax(-1).gather(-1, classes[..., i, None]).squeeze(-1)
+                    for i, head in enumerate(logits)
+                ]
+            )
+            .sum(0)
+            .mean(1)
+        )
+
+
 class ActionCodecPolicy(PreTrainedPolicy):
     config_class: ClassVar[type[ActionCodecConfig]] = ActionCodecConfig
     name: ClassVar[str] = "actioncodec"
@@ -357,7 +587,26 @@ class ActionCodecPolicy(PreTrainedPolicy):
         config.validate_features()
         self.tokenizer = FrozenTokenizerAdapter(config)
         self.obs_encoder = ObservationEncoder(config)
-        self.model = OATExactCached(config, self.obs_encoder.output_dim)
+        model_class = FSQOATExactCached if config.quantizer_type == "semantic_fsq" else OATExactCached
+        self.model = model_class(config, self.obs_encoder.output_dim)
+        action_stats = None if dataset_stats is None else dataset_stats.get(ACTION)
+        self.register_buffer(
+            "action_mean",
+            torch.zeros(config.action_dim)
+            if action_stats is None
+            else torch.as_tensor(action_stats["mean"], dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "action_std",
+            torch.ones(config.action_dim)
+            if action_stats is None
+            else torch.as_tensor(action_stats["std"], dtype=torch.float32),
+            persistent=False,
+        )
+        self._has_action_stats = action_stats is not None
+        self._auxiliary_call_index = 0
+        self._auxiliary_train_call_index = 0
         self._action_queue: deque[PolicyAction] = deque(maxlen=config.n_action_steps)
         self._observation_queues: dict[str, deque[torch.Tensor]] = {}
         self.reset()
@@ -468,6 +717,120 @@ class ActionCodecPolicy(PreTrainedPolicy):
             value = value[:, 0]
         return value.long()
 
+    def _tokenizer_latents(self, logits: torch.Tensor, seed: int, stochastic: bool) -> torch.Tensor:
+        generator = torch.Generator(device=logits.device)
+        generator.manual_seed(int(seed))
+        probabilities = _relaxed_one_hot(
+            logits[..., : self.config.codebook_size],
+            self.config.token_relaxation_temperature,
+            generator=generator,
+            stochastic=stochastic,
+        )
+        return probabilities @ self.tokenizer.codebook_weight
+
+    def _physical_terms(self, prediction: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+        mean = self.action_mean.to(device=prediction.device, dtype=torch.float32)
+        std = self.action_std.to(device=prediction.device, dtype=torch.float32)
+        prediction_raw = prediction.float() * std + mean
+        target_raw = target.float() * std + mean
+        all_indices = torch.arange(self.config.action_dim, device=prediction.device)
+        continuous = _continuous_indices(
+            self.config.action_dim, self.config.continuous_action_indices, prediction.device
+        )
+        recon_loss, recon_mae = _physical_loss(
+            prediction_raw - target_raw, all_indices, self.config.physical_unit_scale
+        )
+        velocity_loss, velocity_mae = _physical_loss(
+            (prediction_raw[:, 1:] - prediction_raw[:, :-1]) - (target_raw[:, 1:] - target_raw[:, :-1]),
+            continuous,
+            self.config.physical_unit_scale,
+        )
+        first_loss, first_mae = _physical_loss(
+            prediction_raw[:, 0] - target_raw[:, 0], all_indices, self.config.physical_unit_scale
+        )
+        return {
+            "recon_loss": recon_loss,
+            "recon_mae": recon_mae,
+            "velocity_loss": velocity_loss,
+            "velocity_mae": velocity_mae,
+            "first_loss": first_loss,
+            "first_mae": first_mae,
+            "raw": prediction_raw,
+            "target_raw": target_raw,
+        }
+
+    def _decode_training_branch(
+        self,
+        action: torch.Tensor,
+        features: torch.Tensor,
+        task_ids: torch.Tensor,
+        seed: int,
+        compute_metrics: bool = True,
+    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor | None, str]:
+        with torch.inference_mode():
+            token_ids = self.tokenizer.tokenize(action)
+        tokens = token_ids.clone()
+        bos = torch.full(
+            (action.shape[0], 1),
+            self.config.codebook_size,
+            dtype=torch.long,
+            device=action.device,
+        )
+        input_ids = torch.cat((bos, tokens), dim=1)
+        teacher_logits = self.model(input_ids[:, :-1], features, task_ids)
+        # Keep this forward's dropout draws independent of diagnostic frequency.
+        # Only the expensive frozen decode below is conditional.
+        probability_seed = seed + 1
+        teacher_decoded = None
+        free_decoded = None
+        if self.config.prefix_corruption_prob == 0 and self.training:
+            teacher_latents = self._tokenizer_latents(teacher_logits, probability_seed, stochastic=True)
+            teacher_decoded = self.tokenizer.decode_train(teacher_latents)
+            auxiliary_decoded = teacher_decoded
+            mode = "teacher_forced"
+        else:
+            if compute_metrics:
+                with torch.no_grad():
+                    teacher_latents = self._tokenizer_latents(
+                        teacher_logits, probability_seed, stochastic=False
+                    )
+                    teacher_decoded = self.tokenizer.decode_train(teacher_latents)
+            bos_embedding = self.model.token_emb(bos)
+            auxiliary_latents = self.model.generate_differentiable(
+                bos_embedding,
+                features,
+                self.config.latent_horizon,
+                task_ids,
+                self.tokenizer.codebook_weight,
+                self.config.token_relaxation_temperature,
+                tokens,
+                self.config.prefix_corruption_prob,
+                seed + 2,
+                stochastic=self.training,
+            )
+            auxiliary_decoded = self.tokenizer.decode_train(auxiliary_latents)
+            mode = "free_running" if self.config.prefix_corruption_prob == 1 else "scheduled_sampling"
+        if self.config.prefix_corruption_prob == 1:
+            free_decoded = auxiliary_decoded
+        elif compute_metrics:
+            # Diagnostic AR dropout must not change the RNG stream used by the paired loss branch.
+            devices = [features.device] if features.is_cuda else []
+            with torch.random.fork_rng(devices=devices), torch.no_grad():
+                free_latents = self.model.generate_differentiable(
+                    self.model.token_emb(bos),
+                    features,
+                    self.config.latent_horizon,
+                    task_ids,
+                    self.tokenizer.codebook_weight,
+                    self.config.token_relaxation_temperature,
+                    tokens,
+                    1.0,
+                    seed + 3,
+                    stochastic=False,
+                )
+                free_decoded = self.tokenizer.decode_train(free_latents)
+        return teacher_decoded, auxiliary_decoded, free_decoded, mode
+
     def forward(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, float]]:
         action = batch[ACTION].float()
         with torch.inference_mode():
@@ -483,15 +846,190 @@ class ActionCodecPolicy(PreTrainedPolicy):
         task_ids = self._task_ids(batch)
         logits = self.model(input_ids[:, :-1], features, task_ids)
         target = input_ids[:, 1:]
-        loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), target.reshape(-1))
-        metrics = {"token_ce": float(loss.detach().item()), **_token_metrics(logits, target)}
+        if self.config.quantizer_type == "semantic_fsq":
+            classes = self.model.token_emb.grid.indices_to_scalar_classes(target)
+            head_ce = _scalar_ce(logits, classes)
+            loss = head_ce.mean()
+            correct = torch.stack([head.argmax(-1) for head in logits], -1).eq(classes)
+            metrics = {
+                "token_ce": float(loss.detach()),
+                "token_nll": float(head_ce.sum().detach()),
+                "scalar_accuracy": float(correct.float().mean()),
+                "token_accuracy": float(correct.all(-1).float().mean()),
+            }
+            for index in range(4):
+                metrics[f"scalar_{index}_ce"] = float(head_ce[index].detach())
+                metrics[f"scalar_{index}_accuracy"] = float(correct[..., index].float().mean())
+            if not self.training and self.config.num_tasks >= 2:
+                swapped = self.model(input_ids[:, :-1], features, (task_ids + 1) % self.config.num_tasks)
+                metrics["task_token_swap_ce_gap"] = float(
+                    (_scalar_ce(swapped, classes).mean() - loss).detach()
+                )
+            return loss, metrics
+        token_ce = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), target.reshape(-1))
+        loss = token_ce
+        metrics = {"token_ce": float(token_ce.detach().item()), **_token_metrics(logits, target)}
+        if self.config.codebook_distance_loss_weight > 0:
+            distance_loss = _codebook_distance_loss(logits, target, self.tokenizer.codebook_weight)
+            weighted_distance = self.config.codebook_distance_loss_weight * distance_loss
+            loss = loss + weighted_distance
+            metrics["codebook_distance_loss"] = float(distance_loss.detach())
+            metrics["weighted_codebook_distance_loss"] = float(weighted_distance.detach())
+            metrics["total_loss"] = float(loss.detach())
+        auxiliary_enabled = any(
+            (
+                self.config.decoded_action_loss_weight,
+                self.config.decoded_velocity_loss_weight,
+                self.config.decoded_first_target_loss_weight,
+                self.config.decoded_overlap_loss_weight,
+                self.config.decoded_seam_loss_weight,
+            )
+        )
+        if not auxiliary_enabled:
+            if (not self.training) and self.config.num_tasks >= 2:
+                swapped_ids = (task_ids + 1) % self.config.num_tasks
+                swapped_logits = self.model(input_ids[:, :-1], features, swapped_ids)
+                swapped_loss = F.cross_entropy(
+                    swapped_logits.reshape(-1, swapped_logits.shape[-1]), target.reshape(-1)
+                )
+                metrics["task_token_swap_ce_gap"] = float((swapped_loss - token_ce).item())
+            return loss, metrics
+        if not self._has_action_stats:
+            raise ValueError("ActionCodec physical auxiliary training requires dataset action stats")
+        pair = batch.get("_actioncodec_pair")
+        if (
+            self.config.decoded_overlap_loss_weight > 0 or self.config.decoded_seam_loss_weight > 0
+        ) and pair is None:
+            raise ValueError("ActionCodec overlap/seam losses require an episode-safe paired batch")
+        seed = self.config.auxiliary_seed + self._auxiliary_call_index * 10_000
+        self._auxiliary_call_index += 1
+        if self.training:
+            self._auxiliary_train_call_index += 1
+        compute_metrics = (
+            not self.training or self._auxiliary_train_call_index % self.config.decoded_metrics_interval == 0
+        )
+        auxiliary_count = max(1, round(action.shape[0] * self.config.auxiliary_batch_fraction))
+        teacher_a, auxiliary_a, free_a, mode = self._decode_training_branch(
+            action[:auxiliary_count],
+            features[:auxiliary_count],
+            task_ids[:auxiliary_count],
+            seed,
+            compute_metrics=compute_metrics,
+        )
+        target_a = action[:auxiliary_count]
+        predictions = [(auxiliary_a, target_a)]
+        teacher_predictions = [] if teacher_a is None else [(teacher_a, target_a)]
+        free_predictions = [] if free_a is None else [(free_a, target_a)]
+        if pair is not None:
+            pair_action = pair[ACTION].float()[:auxiliary_count]
+            pair_features = self.obs_encoder(pair)[:auxiliary_count]
+            pair_task_ids = self._task_ids(pair)[:auxiliary_count]
+            teacher_b, auxiliary_b, free_b, _ = self._decode_training_branch(
+                pair_action, pair_features, pair_task_ids, seed + 5_000, compute_metrics=compute_metrics
+            )
+            predictions.append((auxiliary_b, pair_action))
+            if teacher_b is not None:
+                teacher_predictions.append((teacher_b, pair_action))
+            if free_b is not None:
+                free_predictions.append((free_b, pair_action))
+
+        auxiliary_terms = [self._physical_terms(prediction, target) for prediction, target in predictions]
+        teacher_terms = [
+            self._physical_terms(prediction, target) for prediction, target in teacher_predictions
+        ]
+        free_terms = [self._physical_terms(prediction, target) for prediction, target in free_predictions]
+
+        def average(name: str, terms: list[dict[str, torch.Tensor]]) -> torch.Tensor:
+            return torch.stack([item[name] for item in terms]).mean()
+
+        weighted = (
+            self.config.decoded_action_loss_weight * average("recon_loss", auxiliary_terms)
+            + self.config.decoded_velocity_loss_weight * average("velocity_loss", auxiliary_terms)
+            + self.config.decoded_first_target_loss_weight * average("first_loss", auxiliary_terms)
+        )
+        overlap_loss = action.new_zeros(())
+        seam_loss = action.new_zeros(())
+        overlap_mae = action.new_zeros(())
+        seam_mae = action.new_zeros(())
+        teacher_overlap_loss = action.new_zeros(())
+        teacher_overlap_mae = action.new_zeros(())
+        teacher_seam_loss = action.new_zeros(())
+        teacher_seam_mae = action.new_zeros(())
+        free_overlap_loss = action.new_zeros(())
+        free_overlap_mae = action.new_zeros(())
+        free_seam_loss = action.new_zeros(())
+        free_seam_mae = action.new_zeros(())
+        if pair is not None:
+            raw_a, raw_b = auxiliary_terms[0]["raw"], auxiliary_terms[1]["raw"]
+            raw_target_a, raw_target_b = auxiliary_terms[0]["target_raw"], auxiliary_terms[1]["target_raw"]
+            continuous = _continuous_indices(
+                self.config.action_dim, self.config.continuous_action_indices, action.device
+            )
+            overlap_error = raw_a[:, 16:20] - raw_b[:, :4]
+            overlap_loss, overlap_mae = _physical_loss(
+                overlap_error, continuous, self.config.physical_unit_scale
+            )
+            seam_error = (raw_b[:, 0] - raw_a[:, 15]) - (raw_target_b[:, 0] - raw_target_a[:, 15])
+            seam_loss, seam_mae = _physical_loss(seam_error, continuous, self.config.physical_unit_scale)
+
+            def boundary(terms: list[dict[str, torch.Tensor]]) -> tuple[torch.Tensor, ...]:
+                first, second = terms[0]["raw"], terms[1]["raw"]
+                overlap, overlap_metric = _physical_loss(
+                    first[:, 16:20] - second[:, :4], continuous, self.config.physical_unit_scale
+                )
+                seam, seam_metric = _physical_loss(
+                    (second[:, 0] - first[:, 15]) - (raw_target_b[:, 0] - raw_target_a[:, 15]),
+                    continuous,
+                    self.config.physical_unit_scale,
+                )
+                return overlap, overlap_metric, seam, seam_metric
+
+            if teacher_terms:
+                teacher_overlap_loss, teacher_overlap_mae, teacher_seam_loss, teacher_seam_mae = boundary(
+                    teacher_terms
+                )
+            if free_terms:
+                free_overlap_loss, free_overlap_mae, free_seam_loss, free_seam_mae = boundary(free_terms)
+            weighted = weighted + (
+                self.config.decoded_overlap_loss_weight * overlap_loss
+                + self.config.decoded_seam_loss_weight * seam_loss
+            )
+        loss = loss + weighted
+
+        def log_terms(prefix: str, terms: list[dict[str, torch.Tensor]]) -> None:
+            metrics[f"{prefix}_decoded_reconstruction_loss"] = float(average("recon_loss", terms).detach())
+            metrics[f"{prefix}_decoded_reconstruction_mae"] = float(average("recon_mae", terms).detach())
+            metrics[f"{prefix}_decoded_velocity_loss"] = float(average("velocity_loss", terms).detach())
+            metrics[f"{prefix}_decoded_velocity_mae"] = float(average("velocity_mae", terms).detach())
+            metrics[f"{prefix}_decoded_first_target_loss"] = float(average("first_loss", terms).detach())
+            metrics[f"{prefix}_decoded_first_target_mae"] = float(average("first_mae", terms).detach())
+
+        if teacher_terms:
+            log_terms("teacher_forced", teacher_terms)
+            metrics["teacher_forced_decoded_overlap_loss"] = float(teacher_overlap_loss.detach())
+            metrics["teacher_forced_decoded_overlap_mae"] = float(teacher_overlap_mae.detach())
+            metrics["teacher_forced_decoded_seam_loss"] = float(teacher_seam_loss.detach())
+            metrics["teacher_forced_decoded_seam_mae"] = float(teacher_seam_mae.detach())
+        if free_terms:
+            log_terms("free_running", free_terms)
+            metrics["free_running_decoded_overlap_loss"] = float(free_overlap_loss.detach())
+            metrics["free_running_decoded_overlap_mae"] = float(free_overlap_mae.detach())
+            metrics["free_running_decoded_seam_loss"] = float(free_seam_loss.detach())
+            metrics["free_running_decoded_seam_mae"] = float(free_seam_mae.detach())
+        if mode == "scheduled_sampling":
+            log_terms("scheduled_sampling", auxiliary_terms)
+            metrics["scheduled_sampling_decoded_overlap_loss"] = float(overlap_loss.detach())
+            metrics["scheduled_sampling_decoded_overlap_mae"] = float(overlap_mae.detach())
+            metrics["scheduled_sampling_decoded_seam_loss"] = float(seam_loss.detach())
+            metrics["scheduled_sampling_decoded_seam_mae"] = float(seam_mae.detach())
+        metrics["total_loss"] = float(loss.detach())
         if (not self.training) and self.config.num_tasks >= 2:
             swapped_ids = (task_ids + 1) % self.config.num_tasks
             swapped_logits = self.model(input_ids[:, :-1], features, swapped_ids)
             swapped_loss = F.cross_entropy(
                 swapped_logits.reshape(-1, swapped_logits.shape[-1]), target.reshape(-1)
             )
-            metrics["task_token_swap_ce_gap"] = float((swapped_loss - loss).item())
+            metrics["task_token_swap_ce_gap"] = float((swapped_loss - token_ce).item())
         return loss, metrics
 
     @torch.no_grad()

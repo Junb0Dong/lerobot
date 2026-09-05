@@ -3,7 +3,8 @@
 Ports the oat-exact-policy ``SimpleObservationEncoder`` family onto LeRobot batch keys:
 one encoder per camera from ``config.image_features``, concatenated robot state, and a
 normalized task scalar. ``oat_exact_robomimic`` is the default and uses the same robomimic
-crop, ResNet18Conv, SpatialSoftmax, GroupNorm, and output activation as OAT. The smaller
+ResNet18Conv, SpatialSoftmax, GroupNorm, and output activation as OAT. Its CropRandomizer is
+optional: ``crop_shape=None`` feeds the full resized image to the visual core. The smaller
 ``resnet_spatial`` and ``small_cnn`` variants remain available for legacy checkpoints.
 """
 
@@ -74,6 +75,13 @@ def _flatten_bt(images: torch.Tensor) -> tuple[torch.Tensor, int, int]:
     return images.reshape(bsz * steps, channels, height, width), bsz, steps
 
 
+def _image_shape(image_size: int | tuple[int, int]) -> tuple[int, int]:
+    """Convert a scalar or rectangular image size to ``(height, width)``."""
+    if isinstance(image_size, int):
+        return (image_size, image_size)
+    return (int(image_size[0]), int(image_size[1]))
+
+
 class SmallCnnEncoder(nn.Module):
     """Legacy three-layer CNN kept for old checkpoints and cheap tests."""
 
@@ -94,12 +102,14 @@ class SmallCnnEncoder(nn.Module):
             nn.Linear(128, output_dim),
         )
 
-    def forward(self, images: torch.Tensor, image_size: int) -> torch.Tensor:
+    def forward(self, images: torch.Tensor, image_size: int | tuple[int, int]) -> torch.Tensor:
         images = _as_btchw(images)
         flat, bsz, steps = _flatten_bt(images)
         if flat.numel() and float(flat.max()) > 1.5:
             flat = flat / 255.0
-        flat = F.interpolate(flat, size=(image_size, image_size), mode="bilinear", align_corners=False)
+        image_shape = _image_shape(image_size)
+        if tuple(flat.shape[-2:]) != image_shape:
+            flat = F.interpolate(flat, size=image_shape, mode="bilinear", align_corners=False)
         return self.net(flat).view(bsz, steps, -1)
 
 
@@ -200,13 +210,13 @@ def _replace_batch_norm_with_oat_group_norm(module: nn.Module) -> None:
 
 
 class OATExactRobomimicEncoder(nn.Module):
-    """OAT's per-camera robomimic observation encoder, including crop and output ReLU."""
+    """OAT's per-camera robomimic observation encoder with optional crop and output ReLU."""
 
     def __init__(
         self,
         image_keys: list[str],
-        image_size: int = 128,
-        crop_shape: tuple[int, int] = (76, 76),
+        image_size: int | tuple[int, int] = 128,
+        crop_shape: tuple[int, int] | None = (76, 76),
     ) -> None:
         super().__init__()
         require_package("robomimic", extra="actioncodec")
@@ -217,10 +227,11 @@ class OATExactRobomimicEncoder(nn.Module):
             )
         self.image_keys = list(image_keys)
         self.internal_keys = [f"camera_{index}" for index in range(len(self.image_keys))]
-        self.image_size = int(image_size)
-        self.crop_shape = (int(crop_shape[0]), int(crop_shape[1]))
-        input_shape = (3, self.image_size, self.image_size)
-        cropped_shape = (3, *self.crop_shape)
+        self.image_size = image_size
+        self.image_shape = _image_shape(image_size)
+        self.crop_shape = None if crop_shape is None else (int(crop_shape[0]), int(crop_shape[1]))
+        input_shape = (3, *self.image_shape)
+        visual_core_input_shape = input_shape if self.crop_shape is None else (3, *self.crop_shape)
 
         # LeRobot image feature names contain dots, which cannot be ModuleDict keys. Stable aliases
         # preserve OAT's ObservationEncoder execution order without changing the public batch keys.
@@ -228,7 +239,7 @@ class OATExactRobomimicEncoder(nn.Module):
         encoder = rmon.ObservationEncoder()
         for key in self.internal_keys:
             net = rmbn.VisualCore(
-                input_shape=cropped_shape,
+                input_shape=visual_core_input_shape,
                 feature_dimension=64,
                 backbone_class="ResNet18Conv",
                 backbone_kwargs={"input_channels": 3, "input_coord_conv": False},
@@ -237,17 +248,22 @@ class OATExactRobomimicEncoder(nn.Module):
                 flatten=True,
             )
             _replace_batch_norm_with_oat_group_norm(net)
-            encoder.register_obs_key(
-                name=key,
-                shape=input_shape,
-                net=net,
-                randomizer=rmbn.CropRandomizer(
+            randomizer = (
+                None
+                if self.crop_shape is None
+                else rmbn.CropRandomizer(
                     input_shape=input_shape,
                     crop_height=self.crop_shape[0],
                     crop_width=self.crop_shape[1],
                     num_crops=1,
                     pos_enc=False,
-                ),
+                )
+            )
+            encoder.register_obs_key(
+                name=key,
+                shape=input_shape,
+                net=net,
+                randomizer=randomizer,
             )
         encoder.make()
         self.encoder = encoder
@@ -272,6 +288,7 @@ class ObservationEncoder(nn.Module):
         self.image_keys = list(config.image_features)
         self.state_dim = config.robot_state_feature.shape[0] if config.robot_state_feature is not None else 0
         self.image_size = config.image_size
+        self.image_shape = config.image_shape
         self.num_tasks = max(1, config.num_tasks)
         self.vision_encoder = str(config.vision_encoder)
         self.rgb_mode = str(config.rgb_mode)
@@ -295,8 +312,6 @@ class ObservationEncoder(nn.Module):
             )
             self.robomimic_encoder = None
         elif self.vision_encoder == "oat_exact_robomimic":
-            if self.crop_shape is None:
-                raise ValueError("oat_exact_robomimic requires crop_shape")
             self.image_encoders = nn.ModuleList()
             self.robomimic_encoder = OATExactRobomimicEncoder(
                 self.image_keys,
@@ -311,9 +326,8 @@ class ObservationEncoder(nn.Module):
     def _prepare_camera(self, images: torch.Tensor, *, crop: bool) -> torch.Tensor:
         images = _as_btchw(images)
         flat, bsz, steps = _flatten_bt(_normalize_rgb(images, self.rgb_mode))
-        flat = F.interpolate(
-            flat, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False
-        )
+        if tuple(flat.shape[-2:]) != self.image_shape:
+            flat = F.interpolate(flat, size=self.image_shape, mode="bilinear", align_corners=False)
         if crop and self.crop_shape is not None:
             flat = random_crop_2d(flat, *self.crop_shape)
         _, _, height, width = flat.shape

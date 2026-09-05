@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -34,6 +35,19 @@ def _cosine_beta_schedule(num_steps: int, s: float = 0.008) -> torch.Tensor:
 
 def _linear_beta_schedule(num_steps: int) -> torch.Tensor:
     return torch.linspace(1e-4, 2e-2, int(num_steps), dtype=torch.float32)
+
+
+@lru_cache(maxsize=32)
+def _sampling_steps(num_train_steps: int, num_sample_steps: int) -> tuple[int, ...]:
+    # Keep loop indices on the CPU: extracting each CUDA scalar stalls the sampling stream.
+    return tuple(
+        torch.linspace(num_train_steps - 1, 0, steps=max(1, num_sample_steps), device="cpu")
+        .round()
+        .long()
+        .unique(sorted=True)
+        .flip(0)
+        .tolist()
+    )
 
 
 def _timestep_embedding(timesteps: torch.Tensor, dim: int) -> torch.Tensor:
@@ -268,6 +282,11 @@ class ActionDiffusionDenoiser(nn.Module):
         for block in self.blocks:
             x = block(x, modulation)
         x = self.out_norm(x)
+        if len(self.head) == 1:
+            # The conditioner validates embodiment_ids once before the denoising loop.
+            # Avoid boolean indexing and a mask.any() host synchronization at every step.
+            decoded = self.head[0](x)
+            return F.pad(decoded, (0, self.max_action_dim - decoded.shape[-1]))
         # Allocate from the Linear head output, not from LayerNorm ``x``. Under AMP, LayerNorm
         # stays fp32 while Linear is autocast to fp16; indexed copy then requires matching dtypes.
         output = None
@@ -386,18 +405,23 @@ class ActionDiffusionDecoder(nn.Module):
         latents: torch.Tensor,
         action: torch.Tensor,
         embodiment_ids: torch.Tensor | None = None,
+        timesteps: torch.Tensor | None = None,
+        noise: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run one training step of the diffusion objective.
 
         A single timestep is drawn per sample, the ground-truth window is noised accordingly, and
         the denoiser is scored on how well it recovers the clean window. The loss is masked so that
-        the padding channels of narrower embodiments do not contribute.
+        the padding channels of narrower embodiments do not contribute. ``timesteps`` and ``noise``
+        can be supplied by paired-window training to share the exact diffusion corruption.
 
         Args:
             latents: Quantized latent tokens of shape ``[B, num_tokens, model_dim]``.
             action: Ground-truth action window of shape ``[B, T, A]``; it is zero-padded or
                 truncated to ``max_action_dim``.
             embodiment_ids: Integer tensor of shape ``[B]``. Defaults to embodiment 0.
+            timesteps: Optional diffusion timestep tensor of shape ``[B]``.
+            noise: Optional noise tensor with the action shape before padding/truncation.
 
         Returns:
             Tuple of the predicted clean actions of shape ``[B, T, max_action_dim]`` and the scalar
@@ -407,8 +431,11 @@ class ActionDiffusionDecoder(nn.Module):
             embodiment_ids = latents.new_zeros((latents.shape[0],), dtype=torch.long)
         condition = self.conditioner(latents, embodiment_ids)
         x0 = self._prepare_action(action.to(condition))
-        timesteps = torch.randint(0, self.num_train_steps, (x0.shape[0],), device=x0.device)
-        noise = torch.randn_like(x0)
+        if timesteps is None:
+            timesteps = torch.randint(0, self.num_train_steps, (x0.shape[0],), device=x0.device)
+        else:
+            timesteps = timesteps.to(device=x0.device, dtype=torch.long)
+        noise = torch.randn_like(x0) if noise is None else self._prepare_action(noise.to(x0))
         alpha = self.alphas_cumprod.index_select(0, timesteps).to(x0)
         noisy = alpha.sqrt().view(-1, 1, 1) * x0 + (1.0 - alpha).sqrt().view(-1, 1, 1) * noise
         pred = self.denoiser(noisy, timesteps, condition, embodiment_ids)
@@ -417,6 +444,37 @@ class ActionDiffusionDecoder(nn.Module):
             self._valid_action_mask(pred, embodiment_ids),
         )
         return pred, loss
+
+    def sample_differentiable(
+        self, latents: torch.Tensor, embodiment_ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Sample an action window while preserving gradients to ``latents``.
+
+        The decoder parameters remain frozen by the policy, but this method intentionally does not
+        disable autograd so a physical action loss can train the upstream token logits.
+        """
+        if embodiment_ids is None:
+            embodiment_ids = latents.new_zeros((latents.shape[0],), dtype=torch.long)
+        condition = self.conditioner(latents, embodiment_ids)
+        x = torch.zeros(
+            condition.shape[0],
+            condition.shape[1],
+            self.max_action_dim,
+            device=condition.device,
+            dtype=condition.dtype,
+        )
+        steps = _sampling_steps(self.num_train_steps, self.num_sample_steps)
+        for index, step in enumerate(steps):
+            timestep = torch.full((x.shape[0],), step, device=x.device, dtype=torch.long)
+            x0 = self.denoiser(x, timestep, condition, embodiment_ids)
+            if index == len(steps) - 1:
+                return x0
+            next_step = steps[index + 1]
+            alpha = self.alphas_cumprod[step].to(x)
+            next_alpha = self.alphas_cumprod[next_step].to(x)
+            noise = (x - alpha.sqrt() * x0) / (1.0 - alpha).sqrt().clamp_min(1e-6)
+            x = next_alpha.sqrt() * x0 + (1.0 - next_alpha).sqrt() * noise
+        return x
 
     @torch.no_grad()
     def forward(self, latents: torch.Tensor, embodiment_ids: torch.Tensor | None = None) -> torch.Tensor:
@@ -430,31 +488,4 @@ class ActionDiffusionDecoder(nn.Module):
             Sampled actions of shape ``[B, horizon, max_action_dim]``, where ``horizon`` comes from
             the conditioner and the channels past each embodiment's action dimension are zero.
         """
-        if embodiment_ids is None:
-            embodiment_ids = latents.new_zeros((latents.shape[0],), dtype=torch.long)
-        condition = self.conditioner(latents, embodiment_ids)
-        x = torch.zeros(
-            condition.shape[0],
-            condition.shape[1],
-            self.max_action_dim,
-            device=condition.device,
-            dtype=condition.dtype,
-        )
-        steps = (
-            torch.linspace(self.num_train_steps - 1, 0, steps=max(1, self.num_sample_steps), device=x.device)
-            .round()
-            .long()
-            .unique(sorted=True)
-            .flip(0)
-        )
-        for index, step in enumerate(steps):
-            timestep = torch.full((x.shape[0],), int(step.item()), device=x.device, dtype=torch.long)
-            x0 = self.denoiser(x, timestep, condition, embodiment_ids)
-            if index == len(steps) - 1:
-                return x0
-            next_step = steps[index + 1]
-            alpha = self.alphas_cumprod[step].to(x)
-            next_alpha = self.alphas_cumprod[next_step].to(x)
-            noise = (x - alpha.sqrt() * x0) / (1.0 - alpha).sqrt().clamp_min(1e-6)
-            x = next_alpha.sqrt() * x0 + (1.0 - next_alpha).sqrt() * noise
-        return x
+        return self.sample_differentiable(latents, embodiment_ids)

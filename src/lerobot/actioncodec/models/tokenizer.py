@@ -12,9 +12,40 @@ from ..losses.contrastive import symmetric_info_nce
 from ..losses.semantic_dtw import chunk_hard_dtw_targets, semantic_contrastive_loss
 from ..losses.soft_dtw import chunk_soft_dtw_targets
 from .diffusion_decoder import ActionDiffusionDecoder
+from .fsq import SemanticFSQQuantizer
 from .perceiver import ActionPerceiverDecoder, ActionPerceiverEncoder
 from .quantizer import ResidualVectorQuantizer
 from .vl_embed import VisualLanguageEmbedder
+
+
+def _continuous_indices(
+    action_dim: int, indices: tuple[int, ...] | list[int] | None, device: torch.device
+) -> torch.Tensor:
+    if indices is None:
+        return torch.arange(action_dim, device=device)
+    return torch.as_tensor(indices, device=device, dtype=torch.long)
+
+
+def _physical_loss_and_mae(
+    error: torch.Tensor,
+    action_indices: torch.Tensor,
+    unit_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    selected = error.index_select(-1, action_indices)
+    loss = F.smooth_l1_loss(selected / float(unit_scale), torch.zeros_like(selected))
+    return loss, selected.abs().mean()
+
+
+def _overlap_loss_and_mae(
+    reconstruction: torch.Tensor,
+    action_std: torch.Tensor,
+    shift: int,
+    action_indices: torch.Tensor,
+    unit_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    pair_batch = reconstruction.shape[0] // 2
+    error = (reconstruction[:pair_batch, shift:] - reconstruction[pair_batch:, :-shift]).float() * action_std
+    return _physical_loss_and_mae(error, action_indices, unit_scale)
 
 
 class ActionCodecTokenizer(nn.Module):
@@ -48,10 +79,14 @@ class ActionCodecTokenizer(nn.Module):
         decoder_type: str = "diffusion",
         diffusion_config: dict[str, Any] | None = None,
         use_vl_embedder: bool = False,
+        quantizer_type: str = "vq",
+        fsq_levels: tuple[int, ...] = (8, 5, 5, 5),
     ) -> None:
         """Build the encoder, quantizer, decoder and optional auxiliary heads.
 
         Args:
+            quantizer_type: VQ (default) or semantic_fsq.
+            fsq_levels: Fixed semantic FSQ scalar levels [8,5,5,5].
             action_dim: Action dimension of the default embodiment.
             window_size: Number of action steps in one window, i.e. the tokenized horizon.
             model_dim: Width shared by the encoder, the codebook and the decoder.
@@ -109,15 +144,23 @@ class ActionCodecTokenizer(nn.Module):
             share_latent_transformer=share_encoder_latent_transformer,
             share_cross_attn=share_encoder_cross_attn,
         )
-        self.quantizer = ResidualVectorQuantizer(
-            codebook_size,
-            model_dim,
-            num_codebooks,
-            vq_beta,
-            soft_assignment_temperature=soft_assignment_temperature,
-            dead_code_threshold=dead_code_threshold,
-            reset_noise_scale=reset_noise_scale,
-        )
+        self.quantizer_type = quantizer_type
+        if quantizer_type == "semantic_fsq":
+            if codebook_size != 1000 or num_codebooks != 1:
+                raise ValueError("semantic_fsq requires a single vocabulary of 1000")
+            self.quantizer = SemanticFSQQuantizer(model_dim, fsq_levels)
+        elif quantizer_type == "vq":
+            self.quantizer = ResidualVectorQuantizer(
+                codebook_size,
+                model_dim,
+                num_codebooks,
+                vq_beta,
+                soft_assignment_temperature=soft_assignment_temperature,
+                dead_code_threshold=dead_code_threshold,
+                reset_noise_scale=reset_noise_scale,
+            )
+        else:
+            raise ValueError(f"Unsupported quantizer_type: {quantizer_type}")
         if self.decoder_type == "diffusion":
             diffusion_config = diffusion_config or {}
             self.decoder = ActionDiffusionDecoder(
@@ -183,6 +226,12 @@ class ActionCodecTokenizer(nn.Module):
         """
         return self.decoder(latents, embodiment_ids)
 
+    def decode_train(self, latents: torch.Tensor, embodiment_ids: torch.Tensor | None = None) -> torch.Tensor:
+        """Decode train-time continuous latents without cutting their upstream gradient."""
+        if self.decoder_type == "diffusion":
+            return self.decoder.sample_differentiable(latents, embodiment_ids)
+        return self.decoder(latents, embodiment_ids)
+
     def freeze_encoder(self) -> None:
         """Stop training the encoder, e.g. when only the decoder is being fine-tuned."""
         for parameter in self.encoder.parameters():
@@ -242,13 +291,17 @@ class ActionCodecTokenizer(nn.Module):
         prompts: list[str] | None = None,
         step: int = 0,
         stage: str = "pretrain",
+        action_std: torch.Tensor | None = None,
+        timesteps: torch.Tensor | None = None,
+        noise: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Run one tokenizer training step and assemble the weighted training objective.
 
         Beyond reconstruction and the VQ terms, three optional signals shape the token space: a DTW
         alignment loss that pulls together windows with similar state trajectories, a CLIP loss that
-        anchors tokens to the visual-language embedding, and codebook regularizers. Each is inert
-        unless its weight in ``loss_config`` is positive and its inputs are supplied.
+        anchors tokens to the visual-language embedding, and codebook regularizers. Physical action
+        losses and paired-window overlap consistency are inert unless their weights in
+        ``loss_config`` are positive and ``action_std`` is supplied.
 
         Args:
             action: Action window of shape ``[B, window_size, action_dim]``.
@@ -268,13 +321,19 @@ class ActionCodecTokenizer(nn.Module):
             step: Global training step, compared against ``clip_start_step`` so the CLIP loss can be
                 delayed until reconstruction has stabilized.
             stage: Training stage; the CLIP loss is only applied during ``"pretrain"``.
+            action_std: Dataset action standard deviation used to convert normalized errors to raw
+                action units.
+            timesteps: Optional diffusion timestep(s), shared across paired windows when a pair
+                batch supplies one timestep per pair.
+            noise: Optional union noise of shape ``[pair_batch, horizon + overlap_shift, action_dim]``
+                for paired diffusion training, or per-window noise passed through unchanged.
 
         Returns:
             Mapping whose ``"loss"`` entry is the scalar objective to backpropagate. The remaining
             entries are diagnostics: the detached ``loss_*`` terms, the detached reconstruction
             ``"recon"`` of shape ``[B, window_size, action_dim]``, the integer code ids
-            ``"indices"`` of shape ``[B, num_tokens, num_codebooks]``, and ``"refreshed_codes"``
-            counting the dead codes queued for replacement this step.
+                ``"indices"`` of shape ``[B, num_tokens, num_codebooks]``, and ``"refreshed_codes"``
+                counting the dead codes queued for replacement this step.
 
         Raises:
             ValueError: If ``action`` does not have shape ``[B, window_size, action_dim]``.
@@ -284,8 +343,53 @@ class ActionCodecTokenizer(nn.Module):
         loss_config = loss_config or {}
         z = self.encode(action.float(), embodiment_ids)
         zq, indices, vq_loss = self.quantizer(z)
+        alignment_z = (
+            self.quantizer.last_quantized_coordinates if self.quantizer_type == "semantic_fsq" else z
+        )
+        overlap_weight = float(loss_config.get("overlap_consistency_weight", 0.0))
+        overlap_shift = int(loss_config.get("overlap_shift", 16))
+        decoder_timesteps = timesteps
+        decoder_noise = noise
+        if self.decoder_type == "diffusion" and overlap_weight > 0:
+            if action.shape[0] % 2:
+                raise ValueError("Overlap consistency requires an even batch of [A_batch, B_batch]")
+            pair_batch = action.shape[0] // 2
+            if timesteps is None:
+                pair_timesteps = torch.randint(
+                    0, self.decoder.num_train_steps, (pair_batch,), device=action.device
+                )
+            else:
+                pair_timesteps = timesteps
+            if pair_timesteps.shape[0] == pair_batch:
+                decoder_timesteps = torch.cat((pair_timesteps, pair_timesteps), dim=0)
+            if noise is None:
+                union_noise = torch.randn(
+                    pair_batch,
+                    self.window_size + overlap_shift,
+                    action.shape[-1],
+                    device=action.device,
+                    dtype=action.dtype,
+                )
+            else:
+                union_noise = noise
+            if (
+                union_noise.shape[0] == pair_batch
+                and union_noise.shape[1] == self.window_size + overlap_shift
+            ):
+                noise_a = union_noise[:, : self.window_size]
+                noise_b = union_noise[:, overlap_shift : overlap_shift + self.window_size]
+                decoder_noise = torch.cat((noise_a, noise_b), dim=0)
         if self.decoder_type == "diffusion":
-            reconstruction, reconstruction_loss = self.decoder.forward_train(zq, action, embodiment_ids)
+            if decoder_timesteps is None and decoder_noise is None:
+                reconstruction, reconstruction_loss = self.decoder.forward_train(zq, action, embodiment_ids)
+            else:
+                reconstruction, reconstruction_loss = self.decoder.forward_train(
+                    zq,
+                    action,
+                    embodiment_ids,
+                    timesteps=decoder_timesteps,
+                    noise=decoder_noise,
+                )
             reconstruction = reconstruction[..., : self.action_dim]
         else:
             reconstruction = self.decode(zq, embodiment_ids)[..., : self.action_dim]
@@ -301,7 +405,7 @@ class ActionCodecTokenizer(nn.Module):
                 temperature=float(loss_config.get("temperature", 1.0)),
                 band_frac=float(loss_config.get("band_frac", 0.2)),
             )
-            embeddings = F.normalize(z.float().mean(1), dim=-1)
+            embeddings = F.normalize(alignment_z.float().mean(1), dim=-1)
             alignment_loss = semantic_contrastive_loss(
                 embeddings,
                 positive_mask=pairs.positive_mask,
@@ -319,7 +423,7 @@ class ActionCodecTokenizer(nn.Module):
                 pair_batch_size=int(loss_config.get("chunk_align_pair_batch_size", 8192)),
                 dtw_backend=str(loss_config.get("chunk_align_dtw_backend", "auto")),
             )
-            chunk_embeddings = F.normalize(z.float().mean(1), dim=-1)
+            chunk_embeddings = F.normalize(alignment_z.float().mean(1), dim=-1)
             alignment_loss = (
                 alignment_loss
                 + semantic_contrastive_loss(
@@ -349,6 +453,46 @@ class ActionCodecTokenizer(nn.Module):
                 vl_global,
                 temperature=float(loss_config.get("clip_temperature", 0.07)),
             )
+        physical_recon_weight = float(loss_config.get("physical_recon_weight", 0.0))
+        physical_velocity_weight = float(loss_config.get("physical_velocity_weight", 0.0))
+        if action_std is None and (
+            physical_recon_weight > 0 or physical_velocity_weight > 0 or overlap_weight > 0
+        ):
+            raise ValueError("Physical ActionCodec losses require action_std")
+        physical_enabled = action_std is not None
+        zero = action.new_zeros(())
+        loss_phys_recon = zero
+        loss_phys_velocity = zero
+        loss_overlap = zero
+        physical_recon_mae = zero
+        physical_velocity_mae = zero
+        overlap_mae = zero
+        if physical_enabled:
+            action_std = action_std.to(device=action.device, dtype=torch.float32)
+            if tuple(action_std.shape) != (self.action_dim,):
+                raise ValueError(f"action_std must have shape ({self.action_dim},)")
+            action_indices = _continuous_indices(
+                self.action_dim, loss_config.get("continuous_action_indices"), action.device
+            )
+            unit_scale = float(loss_config.get("physical_unit_scale", 1.0))
+            physical_error = (reconstruction.float() - action.float()) * action_std
+            loss_phys_recon, physical_recon_mae = _physical_loss_and_mae(
+                physical_error, action_indices, unit_scale
+            )
+            pred_velocity = (reconstruction[:, 1:] - reconstruction[:, :-1]).float() * action_std
+            gt_velocity = (action[:, 1:] - action[:, :-1]).float() * action_std
+            loss_phys_velocity, physical_velocity_mae = _physical_loss_and_mae(
+                pred_velocity - gt_velocity, action_indices, unit_scale
+            )
+            if overlap_weight > 0:
+                loss_overlap, overlap_mae = _overlap_loss_and_mae(
+                    reconstruction, action_std, overlap_shift, action_indices, unit_scale
+                )
+        weighted_phys_recon = physical_recon_weight * loss_phys_recon if physical_recon_weight > 0 else zero
+        weighted_phys_velocity = (
+            physical_velocity_weight * loss_phys_velocity if physical_velocity_weight > 0 else zero
+        )
+        weighted_overlap = overlap_weight * loss_overlap if overlap_weight > 0 else zero
         total = (
             float(loss_config.get("weight_recon", 1.0)) * reconstruction_loss
             + float(loss_config.get("weight_vq", 1.0)) * vq_loss
@@ -356,6 +500,9 @@ class ActionCodecTokenizer(nn.Module):
             + float(loss_config.get("weight_codebook_entropy", 0.0)) * entropy_loss
             + clip_loss
             + alignment_loss
+            + weighted_phys_recon
+            + weighted_phys_velocity
+            + weighted_overlap
         )
         return {
             "loss": total,
@@ -365,6 +512,15 @@ class ActionCodecTokenizer(nn.Module):
             "loss_l1": l1_loss.detach(),
             "loss_codebook_entropy": entropy_loss.detach(),
             "loss_clip": clip_loss.detach(),
+            "loss_phys_recon": loss_phys_recon.detach(),
+            "loss_phys_velocity": loss_phys_velocity.detach(),
+            "loss_overlap": loss_overlap.detach(),
+            "weighted_phys_recon": weighted_phys_recon.detach(),
+            "weighted_phys_velocity": weighted_phys_velocity.detach(),
+            "weighted_overlap": weighted_overlap.detach(),
+            "physical_recon_mae": physical_recon_mae.detach(),
+            "physical_velocity_mae": physical_velocity_mae.detach(),
+            "overlap_mae": overlap_mae.detach(),
             "recon": reconstruction.detach(),
             "indices": indices,
             "refreshed_codes": action.new_tensor(float(self.last_refreshed_codes)),

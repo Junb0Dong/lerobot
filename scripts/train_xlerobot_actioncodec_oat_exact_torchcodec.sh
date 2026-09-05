@@ -2,9 +2,9 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-DATASET_ROOT="${DATASET_ROOT:-$(pwd)/../data/my_dataset_0901_no_head}"
-TOKENIZER_PATH="${TOKENIZER_PATH:-$(pwd)/outputs/xlerobot_actioncodec_0901_no_head/tokenizer_matched_h20}"
-OUTPUT_DIR="${OUTPUT_DIR:-$(pwd)/outputs/xlerobot_actioncodec_0901_no_head/policy_oat_exact_vision_torchcodec}"
+DATASET_ROOT="${DATASET_ROOT:-$(pwd)/../data/my_dataset_merged_0902_no_head_96x128}"
+TOKENIZER_PATH="${TOKENIZER_PATH:-$(pwd)/outputs/my_dataset_merged_0902_no_head_96x128/tokenizer_matched_h20}"
+OUTPUT_DIR="${OUTPUT_DIR:-$(pwd)/outputs/my_dataset_merged_0902_no_head_96x128/policy_oat_exact_vision_torchcodec}"
 GPUS="${CUDA_VISIBLE_DEVICES:-0}"
 MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-29503}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
@@ -14,10 +14,10 @@ uv sync --locked \
   --extra diffusion \
   --extra actioncodec
 
-if [[ -d "${OUTPUT_DIR}" ]]; then
-  echo "output_dir already exists: ${OUTPUT_DIR}"
-  echo "removing it so this run can start clean"
-  rm -rf "${OUTPUT_DIR}"
+if [[ -e "${OUTPUT_DIR}" || -L "${OUTPUT_DIR}" ]]; then
+  echo "output_dir already exists: ${OUTPUT_DIR}" >&2
+  echo "choose a new OUTPUT_DIR or remove the old run explicitly" >&2
+  exit 1
 fi
 
 CUDA_VISIBLE_DEVICES="${GPUS}" uv run --no-sync accelerate launch \
@@ -30,7 +30,7 @@ CUDA_VISIBLE_DEVICES="${GPUS}" uv run --no-sync accelerate launch \
   --policy.type=actioncodec --policy.action_dim=12 --policy.num_tasks=1 \
   --policy.tokenizer_path="${TOKENIZER_PATH}" \
   --policy.vision_encoder=oat_exact_robomimic \
-  --policy.image_size=128 --policy.crop_shape='[76,76]' \
+  --policy.image_size=128 --policy.crop_shape='[96,96]' \
   --policy.device=cuda --policy.push_to_hub=false \
   --output_dir="${OUTPUT_DIR}" \
   --job_name=xlerobot_ac_policy_oat_exact_vision_torchcodec \

@@ -1,16 +1,32 @@
+import json
 from unittest.mock import Mock
 
 import pytest
 import torch
 
 from lerobot.actioncodec import ActionCodecTokenizer
-from lerobot.actioncodec.config import ActionCodecTokenizerConfig
+from lerobot.actioncodec.config import (
+    ActionCodecTokenizerConfig,
+    load_tokenizer_config,
+    save_tokenizer_artifact,
+)
 from lerobot.actioncodec.losses.semantic_dtw import chunk_hard_dtw_targets, semantic_contrastive_loss
 from lerobot.actioncodec.losses.soft_dtw import trajectory_soft_dtw_alignments
 from lerobot.actioncodec.metrics import CodebookOccupancyMeter
+from lerobot.actioncodec.models.diffusion_decoder import (
+    ActionDiffusionDecoder,
+    ActionDiffusionDenoiser,
+    _sampling_steps,
+)
 from lerobot.actioncodec.models.perceiver import PositionalEmbedding
 from lerobot.actioncodec.models.quantizer import ResidualVectorQuantizer
-from lerobot.actioncodec.trainer import SemanticTokenizerTrainConfig, _window_start_indices
+from lerobot.actioncodec.models.tokenizer import _overlap_loss_and_mae, _physical_loss_and_mae
+from lerobot.actioncodec.trainer import (
+    PairedWindowDataset,
+    SemanticTokenizerTrainConfig,
+    _paired_window_start_indices,
+    _window_start_indices,
+)
 from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.policies.actioncodec.configuration_actioncodec import ActionCodecConfig
 from lerobot.policies.actioncodec.modeling_actioncodec import ActionCodecPolicy, OATExactCached
@@ -149,6 +165,216 @@ def test_window_start_indices_keeps_full_horizon_windows():
         _window_start_indices([0], [19], horizon=20, stride=4)
 
 
+def test_paired_windows_stay_inside_one_episode_and_share_overlap():
+    class IndexedDataset(torch.utils.data.Dataset):
+        def __len__(self):
+            return 75
+
+        def __getitem__(self, index):
+            values = torch.arange(index, index + 20, dtype=torch.float32).unsqueeze(-1)
+            return {"action": values, "observation.state": values + 100}
+
+    starts = _paired_window_start_indices([0, 40], [40, 75], horizon=20, shift=16, stride=4)
+    assert starts == [0, 4]
+    paired = PairedWindowDataset(IndexedDataset(), starts, shift=16)
+    sample = paired[0]
+    assert sample["action"].shape == (2, 20, 1)
+    torch.testing.assert_close(sample["action"][0, 16:], sample["action"][1, :4])
+    batch = next(iter(torch.utils.data.DataLoader(paired, batch_size=2)))
+    assert batch["action"].shape == (2, 2, 20, 1)
+
+
+def test_auxiliary_config_defaults_and_validation():
+    config = SemanticTokenizerTrainConfig(repo_id="dummy")
+    assert config.overlap_consistency_weight == 0.0
+    assert config.physical_recon_weight == 0.0
+    assert config.physical_velocity_weight == 0.0
+    assert config.to_tokenizer_config().continuous_action_indices is None
+    with pytest.raises(ValueError, match="must be non-negative"):
+        SemanticTokenizerTrainConfig(repo_id="dummy", physical_recon_weight=-1.0)
+    with pytest.raises(ValueError, match="overlap_shift"):
+        SemanticTokenizerTrainConfig(repo_id="dummy", overlap_consistency_weight=1.0, overlap_shift=20)
+
+
+def test_physical_losses_scale_with_std_and_respect_indices():
+    error = torch.ones(2, 20, 3)
+    small, small_mae = _physical_loss_and_mae(error, torch.tensor([0, 1]), 1.0)
+    large, large_mae = _physical_loss_and_mae(error * 10, torch.tensor([0, 1]), 1.0)
+    assert large > small
+    assert large_mae > small_mae
+    selected, selected_mae = _physical_loss_and_mae(
+        torch.stack((torch.ones(2, 20), torch.full((2, 20), 100.0), torch.zeros(2, 20)), dim=-1),
+        torch.tensor([0, 2]),
+        1.0,
+    )
+    assert selected_mae == pytest.approx(0.5)
+    assert selected < large
+
+
+def test_velocity_loss_ignores_constant_offset_but_detects_slope_error():
+    target = torch.arange(20, dtype=torch.float32).view(1, 20, 1)
+    constant = target + 5
+    slope = target + torch.arange(20, dtype=torch.float32).view(1, 20, 1) * 0.5
+    constant_error = torch.diff(constant, dim=1) - torch.diff(target, dim=1)
+    slope_error = torch.diff(slope, dim=1) - torch.diff(target, dim=1)
+    constant_loss, _ = _physical_loss_and_mae(constant_error, torch.tensor([0]), 1.0)
+    slope_loss, _ = _physical_loss_and_mae(slope_error, torch.tensor([0]), 1.0)
+    assert constant_loss == 0
+    assert slope_loss > 0
+
+
+def test_aligned_overlap_is_zero_and_offset_increases_loss():
+    reconstruction_a = torch.randn(2, 20, 3)
+    reconstruction_b = torch.randn(2, 20, 3)
+    reconstruction_b[:, :4] = reconstruction_a[:, 16:]
+    indices = torch.tensor([0, 1])
+    zero, zero_mae = _overlap_loss_and_mae(
+        torch.cat((reconstruction_a, reconstruction_b)), torch.ones(3), 16, indices, 1.0
+    )
+    reconstruction_b[:, :4] += 2.0
+    offset, offset_mae = _overlap_loss_and_mae(
+        torch.cat((reconstruction_a, reconstruction_b)), torch.ones(3), 16, indices, 1.0
+    )
+    assert zero == 0 and zero_mae == 0
+    assert offset > zero and offset_mae > zero_mae
+
+
+def test_diffusion_train_accepts_shared_timestep_and_noise(monkeypatch):
+    decoder = ActionDiffusionDecoder(
+        action_dim=3,
+        model_dim=8,
+        window_size=20,
+        num_heads=2,
+        latent_depth=1,
+        num_cross_layers=1,
+        num_train_steps=8,
+        num_sample_steps=2,
+        denoiser_layers=1,
+    )
+    captured = {}
+    monkeypatch.setattr(
+        decoder.conditioner,
+        "forward",
+        lambda latents, embodiment_ids: torch.zeros(latents.shape[0], 20, 8, dtype=latents.dtype),
+    )
+
+    def capture_denoiser(noisy, timesteps, condition, embodiment_ids):
+        del condition, embodiment_ids
+        captured["noisy"] = noisy.detach()
+        captured["timesteps"] = timesteps.detach()
+        return torch.zeros_like(noisy)
+
+    monkeypatch.setattr(decoder.denoiser, "forward", capture_denoiser)
+    action = torch.zeros(2, 20, 3)
+    noise = torch.arange(120, dtype=torch.float32).view(2, 20, 3)
+    timesteps = torch.tensor([1, 5])
+    decoder.forward_train(torch.zeros(2, 16, 8), action, timesteps=timesteps, noise=noise)
+    assert captured["timesteps"].tolist() == [1, 5]
+    alpha = decoder.alphas_cumprod[timesteps]
+    torch.testing.assert_close(captured["noisy"], (1.0 - alpha).sqrt().view(-1, 1, 1) * noise)
+
+
+def test_tokenizer_pairs_share_union_noise_slices(monkeypatch):
+    tokenizer = ActionCodecTokenizer(
+        action_dim=3,
+        window_size=20,
+        model_dim=32,
+        num_tokens=16,
+        num_heads=4,
+        encoder_layers=1,
+        decoder_layers=1,
+        encoder_cross_layers=1,
+        decoder_cross_layers=1,
+        decoder_type="diffusion",
+        diffusion_config={"num_train_steps": 8, "num_sample_steps": 2, "denoiser_layers": 1},
+    )
+    captured = {}
+
+    def capture_train(latents, action, embodiment_ids=None, timesteps=None, noise=None):
+        del latents, embodiment_ids
+        captured["timesteps"] = timesteps.detach().clone()
+        captured["noise"] = noise.detach().clone()
+        return action, action.new_zeros(())
+
+    monkeypatch.setattr(tokenizer.decoder, "forward_train", capture_train)
+    action = torch.randn(4, 20, 3)
+    union_noise = torch.randn(2, 36, 3)
+    timesteps = torch.tensor([1, 5])
+    tokenizer(
+        action,
+        action_std=torch.ones(3),
+        timesteps=timesteps,
+        noise=union_noise,
+        loss_config={
+            "overlap_consistency_weight": 1.0,
+            "overlap_shift": 16,
+            "continuous_action_indices": (0, 1),
+        },
+    )
+    assert captured["timesteps"].tolist() == [1, 5, 1, 5]
+    expected_noise = torch.cat((union_noise[:, :20], union_noise[:, 16:36]), dim=0)
+    torch.testing.assert_close(captured["noise"], expected_noise)
+
+
+def test_auxiliary_loss_backward_is_finite():
+    tokenizer = ActionCodecTokenizer(
+        action_dim=3,
+        window_size=20,
+        model_dim=32,
+        num_tokens=16,
+        num_heads=4,
+        encoder_layers=1,
+        decoder_layers=1,
+        encoder_cross_layers=1,
+        decoder_cross_layers=1,
+        decoder_type="perceiver",
+    )
+    output = tokenizer(
+        torch.randn(4, 20, 3),
+        action_std=torch.tensor([1.0, 10.0, 20.0]),
+        loss_config={
+            "overlap_consistency_weight": 0.1,
+            "overlap_shift": 16,
+            "physical_recon_weight": 0.1,
+            "physical_velocity_weight": 0.1,
+            "physical_unit_scale": 1.0,
+            "continuous_action_indices": (0, 1),
+        },
+    )
+    output["loss"].backward()
+    assert torch.isfinite(output["loss"])
+    assert all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all() for parameter in tokenizer.parameters()
+    )
+
+
+def test_tokenizer_artifact_round_trip_keeps_aux_config_and_old_config_loads(tmp_path):
+    config = ActionCodecTokenizerConfig(
+        action_dim=3,
+        model_dim=32,
+        num_heads=4,
+        encoder_layers=1,
+        decoder_layers=1,
+        decoder_type="perceiver",
+        physical_recon_weight=0.2,
+        physical_velocity_weight=0.3,
+        overlap_consistency_weight=0.4,
+        overlap_shift=16,
+        continuous_action_indices=(0, 1),
+    )
+    directory = tmp_path / "new"
+    save_tokenizer_artifact(directory, torch.nn.Linear(2, 2), config)
+    loaded = load_tokenizer_config(directory)
+    assert loaded.continuous_action_indices == (0, 1)
+    assert loaded.overlap_consistency_weight == 0.4
+    old = tmp_path / "old"
+    old.mkdir()
+    (old / "model_config.json").write_text(json.dumps({"action_dim": 7}), encoding="utf-8")
+    old_loaded = load_tokenizer_config(old)
+    assert old_loaded.latent_horizon == 16
+    assert old_loaded.overlap_consistency_weight == 0.0
+
+
 def test_diffusion_decoder_train_and_sample_contract():
     tokenizer = ActionCodecTokenizer(
         action_dim=7,
@@ -167,6 +393,45 @@ def test_diffusion_decoder_train_and_sample_contract():
     output = tokenizer(torch.randn(2, 20, 7))
     assert output["recon"].shape == (2, 20, 7)
     assert output["indices"].shape == (2, 16, 1)
+
+
+@pytest.mark.parametrize("sample_steps", [1, 2, 27, 1200])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_cached_diffusion_schedule_matches_tensor_schedule(sample_steps, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA")
+    expected = (
+        torch.linspace(999, 0, steps=sample_steps, device=device)
+        .round()
+        .long()
+        .unique(sorted=True)
+        .flip(0)
+        .tolist()
+    )
+    assert _sampling_steps(1000, sample_steps) == tuple(expected)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_single_embodiment_denoiser_matches_general_path_output_and_gradients(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA")
+    single = ActionDiffusionDenoiser(9, 32, 1, 3, 0, torch.tensor([7])).to(device).eval()
+    general = ActionDiffusionDenoiser(9, 32, 1, 3, 0, torch.tensor([7, 7])).to(device).eval()
+    state = single.state_dict()
+    state.update({key.replace("head.0", "head.1"): value for key, value in state.items() if "head.0" in key})
+    general.load_state_dict(state, strict=True)
+    action = torch.randn(2, 20, 9, device=device)
+    condition = torch.randn(2, 20, 32, device=device, requires_grad=True)
+    ids = torch.zeros(2, device=device, dtype=torch.long)
+    timestep = torch.full((2,), 500, device=device, dtype=torch.long)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=device == "cuda"):
+        optimized = single(action, timestep, condition, ids)
+        reference = general(action, timestep, condition, ids)
+    torch.testing.assert_close(optimized, reference, rtol=0, atol=0)
+    actual_grad = torch.autograd.grad(optimized.float().square().mean(), condition)[0]
+    reference_grad = torch.autograd.grad(reference.float().square().mean(), condition)[0]
+    torch.testing.assert_close(actual_grad, reference_grad, rtol=0, atol=0)
+    assert optimized[..., 7:].count_nonzero() == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA AMP")
@@ -270,8 +535,8 @@ def test_trainer_passes_normalized_action_to_soft_dtw(monkeypatch):
             self.scale = torch.nn.Parameter(torch.ones(()))
             self.quantizer = Quantizer()
 
-        def forward(self, action, delta_state=None, loss_config=None):
-            del loss_config
+        def forward(self, action, delta_state=None, loss_config=None, action_std=None):
+            del loss_config, action_std
             captured.append(delta_state.detach().clone())
             loss = self.scale * action.mean()
             return {
